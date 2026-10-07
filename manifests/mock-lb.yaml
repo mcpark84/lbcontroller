@@ -115,7 +115,7 @@ spec:
       serviceAccountName: mock-lb
       containers:
         - name: mock-lb
-          image: python:3.12-slim          # pip 설치 없음 — 표준 라이브러리만 사용
+          image: mgmt01:5000/poc/python:3.12-slim   # mgmt01:5000 경유(dev001 은 외부 불가), pip 없음
           command: ["python", "-u", "/app/mock_lb.py"]
           env:
             - { name: MOCK_VIP,  value: "10.10.0.100" }

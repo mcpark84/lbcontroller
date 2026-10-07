@@ -95,7 +95,7 @@ spec:
       initContainers:
         # zone 파일은 동적 갱신으로 쓰기가 발생하므로 ConfigMap(read-only) 을 emptyDir 로 복사
         - name: init-zones
-          image: internetsystemsconsortium/bind9:9.18
+          image: mgmt01:5000/poc/bind9:9.18   # dev001 은 외부 레지스트리 접근 불가 → mgmt01:5000 경유
           command: ["sh", "-c", "cp /zones-src/*.zone /var/lib/bind/ && chown -R bind:bind /var/lib/bind && named-checkconf /etc/bind/conf/named.conf && echo conf-ok"]
           volumeMounts:
             - { name: zones-src, mountPath: /zones-src }
@@ -104,7 +104,7 @@ spec:
             - { name: keys,      mountPath: /etc/bind/keys }
       containers:
         - name: bind9
-          image: internetsystemsconsortium/bind9:9.18
+          image: mgmt01:5000/poc/bind9:9.18   # dev001 은 외부 레지스트리 접근 불가 → mgmt01:5000 경유
           command: ["/usr/sbin/named", "-g", "-c", "/etc/bind/conf/named.conf", "-u", "bind"]
           ports:
             - { name: dns-udp, containerPort: 53, protocol: UDP }
