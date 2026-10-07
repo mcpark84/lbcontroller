@@ -566,3 +566,138 @@ BIND9 로그: 같은 초에 `deleting an RR` 3건 (단일 rfc2136 트랜잭션).
 - **탐지는 ExternalDNS 로그가 아니라 상태 지표로.** 알람 후보: (a) `type=LoadBalancer` Service 중 `status.loadBalancer.ingress` 가 비어 있는 것 (kube-state-metrics `kube_service_status_load_balancer_ingress` 부재), (b) Ingress 중 status 가 빈 것, (c) ExternalDNS 의 레코드 수 메트릭(`external_dns_registry_endpoints_total`) 급감.
 - 복구는 컨트롤러만 살리면 **10초 내 자동** (4). 런북에 "수동으로 레코드 넣지 말 것" 을 명시해야 함. 수동 레코드는 owner TXT 가 없어 ExternalDNS 가 관리하지 않으며, 이후 충돌 원인이 된다.
 - 현재 상태: mock 1 replica 복구, NIC Service VIP 복구, tenant-a 에 `web` Ingress 와 레코드만 유지.
+
+---
+
+## 13. T12 — 와일드카드 (테넌트당 1회 등록으로 하위 앱 전부 커버)
+
+> 시험일: 2026-10-07 23:19 ~ 23:21 UTC / 매니페스트 `manifests/t12-wildcard.yaml`
+
+### 13.1 절차와 결과
+
+**1) 와일드카드 Ingress 등록** (`host: "*.tenant-a.poc.internal"`)
+
+| 관측 | 결과 |
+|---|---|
+| NIC | 와일드카드 host 수락, ADDRESS 10.10.0.100 |
+| ExternalDNS | `Adding RR: *.tenant-a.poc.internal 60 A 10.10.0.100` + TXT 2건 (**+5초**) |
+| BIND 존 | `*.tenant-a.poc.internal. 60 IN A 10.10.0.100` 1건 추가 |
+| 임의 이름 해석 | `anything` / `shop` / `api` / `foo-bar` / `x1` .tenant-a.poc.internal → 전부 10.10.0.100 (등록 전에는 NXDOMAIN) |
+
+**2) 신규 앱 shop 추가** — Deployment + Service + Ingress(`shop.tenant-a.poc.internal`), Ingress 에 `external-dns.alpha.kubernetes.io/controller: ignore` 어노테이션으로 ExternalDNS 대상에서 제외. 70초(interval 1회 포함) 관찰:
+
+| 측정 | 전 | 후 | 차이 |
+|---|---|---|---|
+| ExternalDNS Add/Remove 로그 누적 건수 | 39 | 39 | **0** |
+| BIND SOA serial | 2026100707 | 2026100707 | **0** (존 변경 없음) |
+| shop 전용 레코드 | 0 | 0 | 0 |
+| `dig shop.tenant-a.poc.internal` | 10.10.0.100 (와일드카드) | 10.10.0.100 | 해석됨 |
+
+ExternalDNS 로그: `Skipping ingress tenant-a/shop because controller value does not match, found: ignore, required: dns-controller` (debug)
+
+**3) 라우팅 확인** — NIC ClusterIP 로 Host 헤더만 바꿔 호출 (제어 평면 범위 내, VIP 미사용):
+
+```
+Host: shop.tenant-a.poc.internal    → SHOP      (shop Ingress 가 정확 매칭)
+Host: web.tenant-a.poc.internal     → WEB       (web Ingress)
+Host: random.tenant-a.poc.internal  → WEB       (와일드카드 Ingress 의 백엔드 web 으로 fallback)
+```
+nginx 의 server_name 우선순위(정확 일치 > 와일드카드)가 그대로 적용됨.
+
+**4) 대조군** — 제외 어노테이션 없이 `shop2` Ingress 추가 → ExternalDNS 가 12초 내 `shop2.tenant-a.poc.internal A` 전용 레코드 생성 (와일드카드와 중복). 즉 어노테이션이 없으면 앱마다 레코드가 1건씩 쌓임.
+
+### 13.2 판정
+
+| # | 항목 | 합격 기준 | 결과 | 판정 |
+|---|---|---|---|---|
+| T12 | 와일드카드 | `*.tenant-a` 등록 후 앱 추가 시 DNS 작업 0건으로 신규 URL 응답 | Add/Remove 0건, serial 불변, shop URL 해석 + 라우팅 | **합격** |
+
+### 13.3 설계 시사점
+
+- **(a)+(d) 채택안의 이득 실증.** 테넌트 프로비저닝 시 와일드카드 1건만 등록하면 이후 앱 추가는 DNS 를 전혀 건드리지 않음. DNS 변경 승인 절차가 있는 조직에서 앱 배포 속도를 DNS 팀에서 분리하는 효과.
+- **단, ExternalDNS 를 그대로 두면 앱마다 전용 레코드가 중복 생성됨**(대조군). 선택지는 셋: (1) 앱 Ingress 에 `controller: ignore` 어노테이션 (앱 팀 규율 필요), (2) 테넌트 클러스터의 ExternalDNS 를 `--source=ingress` 없이 Service 만 보게 하거나 아예 제거 (와일드카드는 프로비저닝 때 1회 수동/자동 등록), (3) 중복을 허용 (레코드 수 = 앱 수, 운영상 큰 문제는 아님). 설계 결정 필요.
+- **와일드카드의 부작용**: 존재하지 않는 앱 이름도 전부 VIP 로 해석되어 NIC 까지 도달 → 와일드카드 Ingress 의 기본 백엔드가 받음(3 의 random). 운영에서는 기본 백엔드를 404 전용 페이지로 두고, 타이포 도메인 피싱(예: `1ogin.tenant-a...`) 가능성을 보안 검토 항목에 추가.
+- NIC(OSS) 는 와일드카드 host Ingress 를 추가 설정 없이 지원. TLS 는 와일드카드 인증서 1장으로 커버 가능 (cert-manager 연계는 범위 밖).
+
+---
+---
+
+# 1차 PoC 종합 (T0 ~ T12)
+
+> 기간: 2026-10-07 06:00 ~ 2026-10-08 08:30 KST (실작업 약 6시간, 13시간 무인 운영 포함)
+> 결과: **필수 항목 13건 전부 합격. G1 / G2 달성, G3 는 rfc2136 경로 확정(webhook 공수 측정 T13 은 2차).**
+
+## A. 판정 요약
+
+| # | 항목 | 판정 | 핵심 측정값 / 근거 |
+|---|---|---|---|
+| T0 | 환경 점검 | 합격 | K8s 1.35.1, 2노드. dev001 외부 레지스트리 불가 → mgmt01:5000 경유 |
+| T1 | BIND9 단독 | 합격 | SOA NOERROR, TSIG 없는 AXFR 거부 |
+| T2 | ExternalDNS ↔ BIND | 합격 | 양 인스턴스 AXFR 성공, error 0 |
+| T3 | mock write-back ① | 합격 | 1초 내 기록, 멱등, 클래스 미지정 시 무반응 |
+| T4 | NIC 설치 + VIP 수령 | 합격 | 3초 내 EXTERNAL-IP, healthCheckNodePort 32066 |
+| T5 | NIC write-back ② | 합격 | ADDRESS 1.2초 |
+| T6 | Ingress → DNS | 합격 | dig 10.10.0.100 |
+| T7 | 반영 지연 | 합격 | **6.4s / 5.4s** (기준 60s). `--events` 효과 |
+| T8 | domain-filter 경계 | 합격 | 거부 확인. **단독으로는 경계가 아님** → `--namespace` 보정 |
+| T9 | owner-id 충돌 | 합격(재현) | **1분 주기 삭제/재생성 flapping**, 에러 0. 분리 후 중지 |
+| T10 | 삭제 동기화 | 합격 | 6.4s, A+TXT 단일 트랜잭션 |
+| T11 | 무증상 실패 | 합격(재현) | error/warn 0. **기존 레코드까지 삭제됨**. 복구 10s 자동 |
+| T12 | 와일드카드 | 합격 | 앱 추가 시 DNS 작업 **0건** |
+
+## B. 설계/운영에 반영할 결정 사항 (우선순위순)
+
+1. **owner-id 는 클러스터 프로비저닝 자동화에서 UUID 자동 주입** (T9). 기본값 `default` 는 전 클러스터 충돌. 사람이 적는 구조 금지.
+2. **도메인 경계 = 클러스터 분리 + 존별 TSIG 키 분리** (T8). `--domain-filter` 만으로는 타 테넌트 이름 참칭을 못 막음. 공유 클러스터면 `--namespace` 필수. 운영 DNS 요건에 "존별 갱신 키 발급" 추가.
+3. **LB 컨트롤러(CIS) 가 NIC Service 보다 먼저, 올바른 어노테이션으로** (T11). 순서가 바뀌거나 `cis.f5.com/ipamLabel` 누락 시 에러 없이 DNS 미생성. NIC Service 재생성 작업 전 ExternalDNS `upsert-only` 전환.
+4. **탐지는 상태 지표로** (T9, T11). ExternalDNS 로그는 두 사고 모두에서 정상으로 보임. 알람: status 빈 LB Service/Ingress 수, ExternalDNS 레코드 수 급감, 동일 RR 의 주기적 Delete/Create.
+5. **와일드카드 + 앱별 레코드 중복 처리 방식 결정** (T12). ignore 어노테이션 / ExternalDNS 소스 축소 / 중복 허용 중 택1.
+6. **rfc2136 경로 확정** (G3). 사내 DNS 가 BIND 또는 Windows DNS 면 webhook 개발 불필요. 사내 DNS 종류 확인이 WBS 의 선행 과제.
+
+## C. 운영 환경과의 차이 (PoC 한계)
+
+- CIS 는 어노테이션(`ipamLabel`/`ip`)을 요구하고 BIG-IP 설정 성공 후 write-back 할 것으로 추정되나, **status 기록 시점은 F5 에 확인 필요** (문서 미명시).
+- `ipMode` 기본값 `VIP` 확인(T3). CIS 가 `Proxy` 로 쓰는지는 장비 확인 항목.
+- 실트래픽/TLS/헬스체크/BGP 는 범위 밖. T16(healthCheckNodePort 200/503) 은 2차.
+- BIND9 는 emptyDir 라 Pod 재생성 시 존 초기화 → ExternalDNS 가 ≤1분 내 재생성 (운영 DNS 는 해당 없음).
+
+## D. 2차(부가) 항목 — 미실시
+
+| # | 항목 | 준비 상태 |
+|---|---|---|
+| T13 | webhook provider 공수 측정 | 미착수. 사내 DNS 종류 확인 후 필요 여부 결정 |
+| T14 | hostname → CNAME | mock `VIP_FIELD=hostname` 으로 즉시 가능 |
+| T15 | ipMode Proxy 수용 여부 | mock 에 ipMode 필드 추가 1줄로 가능 |
+| T16 | healthCheckNodePort 200/503 | 포트 32066 할당 확인됨. 노드에서 curl 만 하면 됨 |
+
+## E. 현재 클러스터 상태 (1차 종료 시점)
+
+| ns | 리소스 | 상태 |
+|---|---|---|
+| poc-dns | bind9 (threads 2, mem 512Mi) | Running. 존: tenant-a = `web A`, `*.tenant-a A`, ns1 / tenant-b = ns1 |
+| poc-edns | external-dns-tenant-a / -b (`--namespace` 제한, 각자 owner-id) | Running |
+| poc-lb | mock-lb 1 replica | Running |
+| nginx-ingress | nic (OSS 5.6.3), Service VIP 10.10.0.100 | Running |
+| tenant-a | Deployment web, shop / Ingress web, wildcard, shop(ignore) | Running |
+| tenant-b | (없음) | ns 미생성 |
+
+전체 정리가 필요하면:
+```bash
+kubectl delete ns tenant-a; helm -n nginx-ingress uninstall nic; kubectl delete ns nginx-ingress
+kubectl delete -f manifests/mock-lb.yaml -f manifests/external-dns.yaml -f manifests/bind9.yaml
+```
+
+## F. 산출물 위치 (git `mcpark84/lbcontroller`)
+
+| 파일 | 내용 |
+|---|---|
+| `test_result.md` | 본 문서 |
+| `PoC_ExternalDNS_계획서.md` | 계획서 |
+| `manifests/bind9.yaml` | BIND9 (named.conf, zone, Deployment, Service) |
+| `manifests/external-dns.yaml` | ExternalDNS 테넌트별 2개 (정상 설정) |
+| `manifests/t9-owner-collision.yaml` | T9 오설정 (재현용, 적용 금지) |
+| `manifests/mock-lb.yaml` | mock LB 컨트롤러 |
+| `manifests/nic-values.yaml` + `scripts/t4-install-nic.sh` | NIC helm |
+| `manifests/tenant-a-web.yaml`, `t12-wildcard.yaml` | 테넌트 앱/Ingress |
+| `manifests/t3-probe-svc.yaml`, `t8-evil-ingress.yaml`, `t11-web2-ingress.yaml` | 시험용 (삭제 상태) |
+| `scripts/t1-tsig-secret.sh`, `t2-copy-tsig-secret.sh` | TSIG Secret (키는 git 미포함) |
