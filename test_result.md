@@ -355,3 +355,87 @@ tenant-a 의 `web.tenant-a.poc.internal` 은 영향 없이 유지. evil Ingress 
 - 공유 클러스터에서 테넌트를 나눠야 한다면 `--namespace` 또는 `--label-filter` 가 필수. 추가로 BIND 측에서 **존별 TSIG 키 분리**(현재 PoC 는 키 1개를 두 존이 공유)를 해야 ExternalDNS 오설정 시에도 DNS 서버가 2차로 막아줌.
 - NIC 은 host 를 검증하지 않으므로 Ingress 단계에서 막으려면 별도 어드미션 정책(예: Kyverno/Gatekeeper 로 네임스페이스별 허용 도메인 접미사 강제)이 필요.
 - 이 보정(`--namespace`)은 T9 의 전제. tenant-b 인스턴스가 tenant-a 의 Ingress 를 **못 봐야** "내 소유 레코드인데 소스에 없다 → 삭제" 라는 T9 사고가 재현됨.
+
+---
+
+## 10. T9 — `--txt-owner-id` 충돌 (★ 운영 사고 재현)
+
+> 시험일: 2026-10-07 09:42 ~ 09:48 UTC / 오설정 매니페스트 `manifests/t9-owner-collision.yaml`, 복구 `manifests/external-dns.yaml`
+
+### 10.1 오설정 내용 (의도적)
+
+| 플래그 | tenant-a | tenant-b (오설정) | 비고 |
+|---|---|---|---|
+| `--txt-owner-id` | tenant-a-cluster | **tenant-a-cluster** (원래 tenant-b-cluster) | ★ 충돌 |
+| `--domain-filter` | poc.internal | poc.internal | 상위 도메인으로 확장 |
+| `--rfc2136-zone` | tenant-a + tenant-b | tenant-a + tenant-b | BIND 에 poc.internal 상위 존이 없어 존 단위로 열거 |
+| `--namespace` | tenant-a | tenant-b | 유지 (T8 보정. tenant-b 는 tenant-a 의 Ingress 를 못 봄) |
+
+사전 상태: `web.tenant-a.poc.internal A 10.10.0.100`, TXT `owner=tenant-a-cluster` (T5 에서 생성, 안정 상태)
+
+### 10.2 결과 — flapping 재현
+
+오설정 적용 09:42:01. `web.tenant-a.poc.internal` 을 5초 간격으로 질의한 결과:
+
+```
+09:42:03 A=(없음)        ← tenant-b 가 삭제
+09:42:08 A=10.10.0.100   ← tenant-a 가 재생성
+09:43:04 A=(없음)
+09:43:14 A=10.10.0.100
+09:44:09 A=(없음)
+09:44:14 A=10.10.0.100
+```
+
+**1분 주기(`--interval=1m`)로 삭제 → 재생성이 무한 반복.** 매 주기마다 5~10초 동안 레코드가 존재하지 않음.
+
+tenant-b ExternalDNS 로그 (삭제 주체):
+```
+09:42:03 ApplyChanges (Create: 0, UpdateOld: 0, UpdateNew: 0, Delete: 3)
+09:42:03 Removing RR: web.tenant-a.poc.internal 60 A 10.10.0.100
+09:42:03 Removing RR: web.tenant-a.poc.internal 0 TXT "heritage=external-dns,external-dns/owner=tenant-a-cluster,..."
+09:42:03 Removing RR: a-web.tenant-a.poc.internal 0 TXT "..."
+(09:43:03, 09:44:04 동일 반복)
+```
+
+tenant-a ExternalDNS 로그 (재생성 주체):
+```
+09:42:08 ApplyChanges (Create: 3, UpdateOld: 0, UpdateNew: 0, Delete: 0)
+09:42:08 Adding RR: web.tenant-a.poc.internal 60 A 10.10.0.100
+(09:43:09, 09:44:10 동일 반복)
+```
+
+BIND9 로그 (누가 썼는지 Pod IP 로 식별. .45 = tenant-b, .5 = tenant-a):
+```
+09:44:04 client 10.233.95.45/key externaldns: updating zone 'tenant-a.poc.internal/IN': deleting an RR at web.tenant-a.poc.internal A
+09:44:10 client 10.233.95.5/key externaldns:  updating zone 'tenant-a.poc.internal/IN': adding an RR at 'web.tenant-a.poc.internal' A 10.10.0.100
+09:45:04 client 10.233.95.45/key externaldns: updating zone 'tenant-a.poc.internal/IN': deleting an RR at web.tenant-a.poc.internal A
+```
+
+**메커니즘.** tenant-b 인스턴스는 AXFR 로 tenant-a 존을 읽고 `web` 레코드의 TXT `owner=tenant-a-cluster` 가 자기 owner-id 와 같으므로 "내 소유" 로 판단. 그런데 자기 소스(tenant-b 네임스페이스)에는 해당 Ingress 가 없으므로 `--policy=sync` 규칙에 따라 "더 이상 필요 없는 내 레코드" 로 간주해 삭제. tenant-a 인스턴스는 다음 루프에서 소스에 Ingress 가 있는데 레코드가 없으니 재생성. **양쪽 모두 각자의 규칙대로 정상 동작하면서 사고가 발생**하며, 어느 쪽에도 에러 로그가 남지 않음.
+
+### 10.3 복구 — owner-id 분리
+
+09:45:25 원래 설정(`tenant-b-cluster`, 각자 존/필터) 재적용. 이후 2분 30초 관측:
+
+```
+09:45:27 A=10.10.0.100   (이후 변화 없음)
+```
+
+- tenant-b 로그 `Removing RR` 건수: **0**
+- tenant-b 는 자기 존의 ns1 레코드에 대해 `Skipping endpoint ... because owner id does not match` 만 반복 (정상 보호 동작)
+- tenant-a 로그: `All records are already up to date` 반복, 재생성 없음
+- 최종: `web.tenant-a.poc.internal A 10.10.0.100`, TXT `owner=tenant-a-cluster` 안정
+
+### 10.4 판정
+
+| # | 항목 | 합격 기준 | 결과 | 판정 |
+|---|---|---|---|---|
+| T9 | `--txt-owner-id` 충돌 | 삭제가 재현되어야 함(위험 실증), owner-id 분리 후 삭제 중지 | 1분 주기 flapping 3회 관측, 분리 후 0건 | **합격** |
+
+### 10.5 설계 시사점 (★ G2 핵심 산출물 — 프로비저닝 자동화 요건)
+
+- **`--txt-owner-id` 는 클러스터 간 전역 유일해야 한다.** 같은 DNS 존 집합을 공유하는 모든 ExternalDNS 인스턴스에 대해, 하나라도 겹치면 서로의 레코드를 지운다. 사고는 **에러 없이, 1분마다, 조용히** 발생하므로 모니터링으로 잡기 어려움. 사용자 증상은 "간헐적 NXDOMAIN".
+- **클러스터 프로비저닝 자동화에서 owner-id 를 UUID(또는 클러스터 ID)로 자동 주입할 것.** 사람이 값을 적는 구조(복사 붙여넣기)에서는 이 사고가 반드시 발생한다. ExternalDNS 의 기본값은 `"default"` 이므로 **플래그를 빼먹으면 모든 클러스터가 같은 owner-id 가 된다** = 최악의 경우가 기본값.
+- T8 과 결합하면: `--domain-filter` 를 넓게(상위 도메인) 주는 운영이 owner-id 충돌과 만나면 피해 범위가 전 테넌트로 확대. **domain-filter 는 가능한 좁게**(테넌트 존 단위) 유지해야 피해를 격리할 수 있음.
+- 2차 방어: BIND 측 **존별 TSIG 키 분리**. tenant-b 의 키로 tenant-a 존을 못 쓰게 하면 ExternalDNS 오설정이 있어도 DNS 서버가 거부(`REFUSED`). 현재 PoC 는 키 1개 공유라 이 방어가 없음. 운영 DNS 요건에 반영 필요.
+- 탐지 수단 후보: ExternalDNS 로그의 `Delete: N` 이 **매 interval 마다 같은 레코드에 반복** 되는 패턴, 또는 DNS 서버 측 동일 RR 의 add/delete 반복. 운영 런북(§ T11 산출물)에 포함할 것.
