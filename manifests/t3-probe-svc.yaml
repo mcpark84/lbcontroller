@@ -1,0 +1,27 @@
+# T3 — mock write-back ① 검증용 Service 2개 (poc-lb ns)
+#  - t3-probe-lb      : loadBalancerClass=neocloud.poc/mock → EXTERNAL-IP 가 <pending> → 10.10.0.100 이어야 합격
+#  - t3-probe-noclass : loadBalancerClass 미지정(대조군)     → <pending> 유지 + mock 로그 無 (계획서 §5.3 "무반응" 재현)
+# loadBalancerClass 는 immutable 이므로 바꾸려면 Service 재생성
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: t3-probe-lb
+  namespace: poc-lb
+spec:
+  type: LoadBalancer
+  loadBalancerClass: neocloud.poc/mock
+  selector: { app: none }
+  ports:
+    - { port: 80, targetPort: 80 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: t3-probe-noclass
+  namespace: poc-lb
+spec:
+  type: LoadBalancer
+  selector: { app: none }
+  ports:
+    - { port: 80, targetPort: 80 }
