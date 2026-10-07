@@ -496,3 +496,4 @@ BIND9 로그: 같은 초에 `deleting an RR` 3건 (단일 rfc2136 트랜잭션).
 | external-dns-tenant-a | 2회 (exit 1, 09:54 UTC) | bind9 재시작 순간 AXFR 접속 거부 → 기동 시 run-once 가 `fatal` 종료 | 조치 불필요. K8s 가 재시작해 자동 복구. **ExternalDNS 는 DNS 서버 불가 시 crash-loop 로 드러난다** (조용히 멈추지 않음) → 모니터링 포인트 |
 
 - bind9 가 컨테이너 재시작(Pod 재생성 아님)이었기 때문에 emptyDir 의 존 저널이 보존되어 레코드가 유지됨. **Pod 가 재생성되면 존은 ConfigMap 초기 상태로 리셋**되며, 다음 ExternalDNS 루프(≤1분)가 레코드를 재생성함. PoC 에서는 허용. 운영 DNS 는 영속 스토리지가 있으므로 해당 없음.
+- **조치 검증 (22:57 UTC):** 수정된 bind9 적용 후 `found 32 CPUs, using 2 worker threads / 2 UDP listeners` 확인. Pod 재생성으로 존이 초기화되었고, tenant-a ExternalDNS 가 **32초 후**(K8s 이벤트 없이 `--interval=1m` 루프에 의해) `web.tenant-a.poc.internal` 을 재생성. → **DNS 서버 데이터 유실 시 복구 시간 ≤ interval** 이라는 추가 측정값.
