@@ -68,6 +68,7 @@ spec:
           args:
             - --source=service
             - --source=ingress
+            - --namespace=tenant-a                       # ★ T8 보정: 운영의 "테넌트당 클러스터" 모사 — 자기 테넌트 ns 만 감시
             - --provider=rfc2136
             - --rfc2136-host=bind9.poc-dns.svc.cluster.local
             - --rfc2136-port=53
@@ -114,6 +115,7 @@ spec:
           args:
             - --source=service
             - --source=ingress
+            - --namespace=tenant-b                       # ★ T8 보정
             - --provider=rfc2136
             - --rfc2136-host=bind9.poc-dns.svc.cluster.local
             - --rfc2136-port=53
