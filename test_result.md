@@ -497,3 +497,72 @@ BIND9 로그: 같은 초에 `deleting an RR` 3건 (단일 rfc2136 트랜잭션).
 
 - bind9 가 컨테이너 재시작(Pod 재생성 아님)이었기 때문에 emptyDir 의 존 저널이 보존되어 레코드가 유지됨. **Pod 가 재생성되면 존은 ConfigMap 초기 상태로 리셋**되며, 다음 ExternalDNS 루프(≤1분)가 레코드를 재생성함. PoC 에서는 허용. 운영 DNS 는 영속 스토리지가 있으므로 해당 없음.
 - **조치 검증 (22:57 UTC):** 수정된 bind9 적용 후 `found 32 CPUs, using 2 worker threads / 2 UDP listeners` 확인. Pod 재생성으로 존이 초기화되었고, tenant-a ExternalDNS 가 **32초 후**(K8s 이벤트 없이 `--interval=1m` 루프에 의해) `web.tenant-a.poc.internal` 을 재생성. → **DNS 서버 데이터 유실 시 복구 시간 ≤ interval** 이라는 추가 측정값.
+
+---
+
+## 12. T11 — write-back 누락 무증상 실패 (★ 운영 런북 근거)
+
+> 시험일: 2026-10-07 23:00 ~ 23:06 UTC / 신규 Ingress `manifests/t11-web2-ingress.yaml` (web2, web3)
+
+### 12.1 시험 절차와 결과 요약
+
+| 단계 | 조작 | 관측 |
+|---|---|---|
+| 1 | mock-lb `scale --replicas=0` | NIC Service EXTERNAL-IP **10.10.0.100 유지** (status 는 컨트롤러가 죽어도 남음) |
+| 1' | 그 상태에서 Ingress `web2` 생성 | ADDRESS 즉시 10.10.0.100, **DNS 6초 만에 정상 등록** → mock 다운만으로는 아무 증상 없음 |
+| 2 | NIC Service status 를 비움 (`ingress: null`) = "컨트롤러 부재 중 Service 가 (재)생성된 상황" 모사 | EXTERNAL-IP `<pending>`. NIC 이 0.0초 만에 `Updating status for 2 Ingresses` → web, web2 ADDRESS **빈 칸** |
+| 2' | ExternalDNS 반응 | 6초 후 `No endpoints could be generated from ingress tenant-a/web`, `ApplyChanges (Delete: 6)` → **web, web2 의 A/TXT 전부 삭제** |
+| 3 | write-back 부재 상태에서 Ingress `web3` 생성, 75초 관찰 | ADDRESS 빈 칸. ExternalDNS 로그: `No endpoints could be generated from ingress tenant-a/web3` (debug) 2회, **error/warn 0건**, info 는 `All records are already up to date`. DNS 없음 |
+| 4 | mock `scale --replicas=1` | ① Service EXTERNAL-IP +2s → ② Ingress 3개 ADDRESS +2s → ③ DNS web3 +7s. web, web2 레코드도 자동 재생성 |
+| 5 | web2, web3 삭제 | 레코드 10초 내 소멸, web 만 유지 |
+
+### 12.2 핵심 로그
+
+**3단계 — 무증상.** ExternalDNS 는 "할 일이 없다" 고만 말함:
+```
+23:04:15 level=debug msg="No endpoints could be generated from ingress tenant-a/web3"
+23:04:15 level=info  msg="All records are already up to date"
+23:05:16 level=debug msg="No endpoints could be generated from ingress tenant-a/web3"
+23:05:16 level=info  msg="All records are already up to date"
+```
+- `level=error` / `level=warn`: **0건** (ExternalDNS, NIC 모두)
+- 유일한 단서는 **debug 레벨** 의 `No endpoints could be generated` 인데, 이 메시지는 ClusterIP Service 수십 개에 대해서도 매 루프 똑같이 찍히므로(§3 비고) 운영 로그 레벨(info)에서는 보이지 않고, debug 로 올려도 노이즈에 묻힘.
+
+**2' 단계 — 기존 레코드 삭제.**
+```
+23:04:07 ApplyChanges (Create: 0, UpdateOld: 0, UpdateNew: 0, Delete: 6)
+23:04:07 Removing RR: web.tenant-a.poc.internal 60 A 10.10.0.100
+23:04:07 Removing RR: web2.tenant-a.poc.internal 60 A 10.10.0.100
+```
+
+**4단계 — 복구 체인.** mock 재기동 후 2초 만에 ①②, 7초 만에 ③ 까지 자동 회복. 수동 개입 불필요.
+
+### 12.3 판정
+
+| # | 항목 | 합격 기준 | 결과 | 판정 |
+|---|---|---|---|---|
+| T11 | write-back 누락 무증상 실패 | ExternalDNS 에 에러 로그가 남지 않고 DNS 에도 레코드가 생기지 않음 | error/warn 0건, DNS 없음, ADDRESS 빈 칸 | **합격** (재현됨) |
+
+### 12.4 운영 런북 (초안) — "DNS 가 안 생겨요" 신고 시
+
+```
+1. kubectl -n <tenant> get ingress <name>          → ADDRESS 칸 확인
+   ├─ 비어 있음 → 2 로
+   └─ VIP 있음 → ExternalDNS 쪽 문제 (domain-filter / owner-id / DNS 서버 접속). ExternalDNS 로그 확인
+2. kubectl -n <nic-ns> get svc <nic-svc>            → EXTERNAL-IP 확인
+   ├─ <pending> → 3 으로
+   └─ VIP 있음 → NIC 의 reportIngressStatus 설정 / NIC 로그 확인
+3. LB 컨트롤러(CIS) 상태 확인
+   - Pod Running 인가 / 로그에 403, AS3 오류 있는가
+   - Service 에 loadBalancerClass + cis.f5.com/ipamLabel(또는 /ip) 어노테이션이 있는가  ← 누락 시 CIS 는 조용히 무시
+   - IPAM 풀 고갈 여부
+```
+**ExternalDNS 로그부터 보지 말 것.** 이 사고에서 ExternalDNS 로그는 정상으로 보인다.
+
+### 12.5 설계 시사점
+
+- **status 는 영속적이다.** LB 컨트롤러가 죽어도 이미 기록된 VIP 는 남으므로 기존 서비스는 영향이 없고, 신규 Ingress 도 NIC 이 기존 VIP 를 복사해 정상 등록된다(1'). 사고는 **"컨트롤러 부재 중 NIC Service 가 처음 만들어지거나 재생성될 때"** 발생. 전형적 상황: 신규 클러스터 프로비저닝 시 CIS 가 NIC 보다 늦게 뜨거나 CIS 설정(어노테이션/클래스) 이 틀린 경우.
+- **write-back 상실은 "미생성" 에 그치지 않고 "기존 레코드 삭제" 로 번진다** (2'). `--policy=sync` 에서 Ingress.status 가 비면 ExternalDNS 는 해당 레코드가 더 이상 필요 없다고 판단해 지운다. NIC Service 가 재생성되는 운영 작업(helm 재설치, Service 타입 변경 등) 전에는 **ExternalDNS 를 먼저 멈추거나 `--policy=upsert-only` 로 전환** 해야 전 테넌트 DNS 가 일시에 사라지는 사고를 피할 수 있다.
+- **탐지는 ExternalDNS 로그가 아니라 상태 지표로.** 알람 후보: (a) `type=LoadBalancer` Service 중 `status.loadBalancer.ingress` 가 비어 있는 것 (kube-state-metrics `kube_service_status_load_balancer_ingress` 부재), (b) Ingress 중 status 가 빈 것, (c) ExternalDNS 의 레코드 수 메트릭(`external_dns_registry_endpoints_total`) 급감.
+- 복구는 컨트롤러만 살리면 **10초 내 자동** (4). 런북에 "수동으로 레코드 넣지 말 것" 을 명시해야 함. 수동 레코드는 owner TXT 가 없어 ExternalDNS 가 관리하지 않으며, 이후 충돌 원인이 된다.
+- 현재 상태: mock 1 replica 복구, NIC Service VIP 복구, tenant-a 에 `web` Ingress 와 레코드만 유지.
