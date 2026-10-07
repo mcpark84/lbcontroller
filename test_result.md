@@ -191,3 +191,105 @@ kubectl -n poc-edns logs deploy/external-dns-tenant-a | grep "Adding RR"
 kubectl -n poc-lb delete svc svc-dns-probe
 sleep 10; dig @$BIND svcprobe.tenant-a.poc.internal +short            # (빈 응답)
 ```
+
+---
+---
+
+# 2차 시험 — Ingress 경로 (T4 / T5 / T6 / T7)
+
+> 시험일: 2026-10-07 09:08 ~ 09:33 UTC
+> 추가 구성요소: F5 NGINX Ingress Controller OSS 5.6.3 (helm chart nginx-stable/nginx-ingress 2.7.3)
+
+## 7. T4 — NIC 설치 + Service(type=LB) VIP 수령
+
+### 7.1 설치 내용
+
+- helm release `nic`, 네임스페이스 `nginx-ingress`, 차트 tgz 는 서버 `~/charts/nginx-ingress-2.7.3.tgz` 에 보관(오프라인 재설치용)
+- values: `manifests/nic-values.yaml`, 설치 스크립트: `scripts/t4-install-nic.sh`
+
+| values 키 | 값 | 목적 |
+|---|---|---|
+| controller.image.repository / tag | `mgmt01:5000/poc/nginx-ingress` / `5.6.3` | 사설 레지스트리 경유 |
+| controller.ingressClass.name | `neocloud` (setAsDefaultIngress=false) | 테넌트 Ingress 가 명시적으로 선택 |
+| controller.service.type / loadBalancerClass | `LoadBalancer` / `neocloud.poc/mock` | mock 컨트롤러 처리 조건 |
+| controller.service.externalTrafficPolicy | `Local` (차트 기본값) | healthCheckNodePort 자동 할당 (T16) |
+| controller.reportIngressStatus.enable | `true` | **write-back ② 의 실체** |
+| controller.enableCustomResources | `false` + `--skip-crds` | VirtualServer CRD 미설치, 표준 Ingress 만 검증 |
+
+### 7.2 결과
+
+```
+NAME                                                READY   STATUS    NODE
+pod/nic-nginx-ingress-controller-5b4578c9bd-6rjkh   1/1     Running   mgmt01
+
+NAME                                   TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)
+service/nic-nginx-ingress-controller   LoadBalancer   10.233.23.245   10.10.0.100   80:31048/TCP,443:32288/TCP
+
+NAME       CONTROLLER                     PARAMETERS   AGE
+neocloud   nginx.org/ingress-controller   <none>       3s
+```
+
+- NIC Service status: `{"loadBalancer":{"ingress":[{"ip":"10.10.0.100","ipMode":"VIP"}]}}`, `loadBalancerClass=neocloud.poc/mock`, `healthCheckNodePort=32066`
+- mock-lb 로그: `[write-back] nginx-ingress/nic-nginx-ingress-controller -> ip=10.10.0.100` (1회)
+- NIC 기동 로그: `NGINX Ingress Controller Version=5.6.3 ... Kubernetes version: 1.35.1`, 에러 없음
+- 클러스터 내 nginx 관련 CRD: 0개
+
+**판정: 합격** — 설치 3초 시점에 EXTERNAL-IP 수령.
+
+> 참고: 설치한 것은 F5(NGINX Inc.) 의 NGINX Ingress Controller **OSS 에디션**이며, 커뮤니티 Ingress-NGINX(`k8s.io/ingress-nginx`)와 다른 제품. IngressClass 컨트롤러 값 `nginx.org/ingress-controller` 가 식별자. OSS/Plus 차이는 데이터플레인 기능이라 본 PoC 검증 항목(reportIngressStatus, 표준 Ingress 처리)에는 영향 없음.
+
+## 8. T5 / T6 / T7 — Ingress 생성 → write-back ② → DNS 등록 + 지연 측정
+
+### 8.1 적용 매니페스트 (`manifests/tenant-a-web.yaml`)
+
+- Namespace `tenant-a`
+- Deployment `web` (`mgmt01:5000/poc/nginx:1.28.0-alpine`, 1 replica)
+- Service `web` **ClusterIP** (앱 Service 는 VIP 를 소모하지 않음, NIC Service 1개가 VIP 공유)
+- Ingress `web`: `ingressClassName: neocloud`, `host: web.tenant-a.poc.internal`, `/ → web:80`
+
+apply 시각: `2026-10-07T09:32:44.354Z`
+
+### 8.2 결과 — 시간순
+
+| 경과 | 단계 | 근거 |
+|---|---|---|
+| +0.1s | NIC 이 Ingress 감지 | NIC 로그 `resource_kind=Ingress resource_name=web ... AddedOrUpdated` |
+| +0.3s | **write-back ② 완료** | NIC 로그 `status.go:169 ... updated status for ing: tenant-a web` |
+| +1.2s | `kubectl get ingress` ADDRESS 표시 | `10.10.0.100` |
+| +5s | ExternalDNS 가 Ingress 읽음 | `Endpoints generated from ingress: tenant-a/web: [web.tenant-a.poc.internal 0 IN A 10.10.0.100 []]` |
+| +5s | rfc2136 갱신 | `Adding RR: web.tenant-a.poc.internal 60 A 10.10.0.100` + TXT 2건 |
+| **+6.4s** | **`dig` 성공 (T7 측정값)** | `dig @10.233.18.38 web.tenant-a.poc.internal +short → 10.10.0.100` |
+
+```
+$ kubectl -n tenant-a get ingress
+NAME   CLASS      HOSTS                       ADDRESS       PORTS   AGE
+web    neocloud   web.tenant-a.poc.internal   10.10.0.100   80      6s
+
+$ kubectl -n tenant-a get ingress web -o jsonpath='{.status}'
+{"loadBalancer":{"ingress":[{"ip":"10.10.0.100"}]}}
+
+$ dig @10.233.18.38 TXT web.tenant-a.poc.internal +short
+"heritage=external-dns,external-dns/owner=tenant-a-cluster,external-dns/resource=ingress/tenant-a/web"
+```
+
+- 앱 Pod `web-5bdd85699f-9rmt5` Running 1/1 (mgmt01)
+- NIC 로그의 `Error retrieving endpoints for the service web: no endpointslices for target port 80` 경고는 Ingress 가 Pod 보다 먼저 처리되어 발생한 일시 메시지. 직후 Pod 기동으로 해소
+- Ingress.status 에는 `ipMode` 가 없음 (Service.status 에만 존재하는 필드)
+
+### 8.3 판정
+
+| # | 항목 | 합격 기준 | 결과 | 판정 |
+|---|---|---|---|---|
+| T4 | NIC 설치 + Service(type=LB) | NIC Service 가 VIP 수령 | 10.10.0.100, 3초 내 | **합격** |
+| T5 | NIC write-back ② | `get ingress` ADDRESS 에 VIP | 10.10.0.100, 1.2초 | **합격** |
+| T6 | Ingress → DNS 등록 | `dig web.tenant-a.poc.internal` 이 VIP 반환 | 10.10.0.100 | **합격** |
+| T7 | 반영 지연 | apply → dig 성공 60초 이내 | **6.4초** (1회 측정) | **합격** |
+
+**G1 달성.** ① mock → Service.status, ② NIC → Ingress.status, ExternalDNS → BIND9 전 구간이 Ingress 경로로 동작 확인. Service 어노테이션 경로(§3)와 Ingress 경로(§8) 모두 성립.
+
+### 8.4 비고
+
+- **write-back ② 의 의존 관계.** NIC 은 Ingress.status 에 쓸 IP 를 자기 Service(`nic-nginx-ingress-controller`) 의 `status.loadBalancer.ingress` 에서 읽음. ① 이 비면 ② 도 비고, ExternalDNS 는 입력이 없어 조용히 아무것도 안 함 → T11 에서 재현할 무증상 실패의 원인 지점.
+- **지연의 구성.** 6.4초 중 NIC 처리 ~0.3초, ExternalDNS 의 이벤트 반응 + rfc2136 전송 ~5초. `--events` 가 없으면 `--interval=1m` 까지 늘어남. T7 은 1회 측정값이며 반복 측정 시 ±수 초 변동 예상.
+- **Ingress 패턴의 IP 효율.** 앱 Service 가 ClusterIP 이므로 테넌트 앱이 늘어나도 VIP 는 NIC Service 1개분만 소모. 시나리오 B(§3) 와의 핵심 차이.
+- 현재 상태: tenant-a 의 web Deployment/Service/Ingress 와 DNS 레코드는 **유지 중** (T8~T12 에서 재사용).
