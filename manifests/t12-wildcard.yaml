@@ -1,0 +1,73 @@
+# T12 — 와일드카드 등록. 테넌트당 1회 등록으로 하위 앱 URL 전부 커버 (설계 (a)+(d) 안의 핵심 이득)
+#  1) wildcard Ingress → ExternalDNS 가 *.tenant-a.poc.internal A 레코드 1건 생성
+#  2) 이후 앱(shop) 은 external-dns.alpha.kubernetes.io/controller=ignore 로 ExternalDNS 대상에서 제외
+#     → DNS 작업 0건, shop.tenant-a.poc.internal 은 와일드카드로 해석
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: wildcard
+  namespace: tenant-a
+spec:
+  ingressClassName: neocloud
+  rules:
+    - host: "*.tenant-a.poc.internal"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port: { number: 80 }
+---
+# 신규 앱 shop (web 과 같은 nginx 이미지, 별도 Deployment/Service)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop
+  namespace: tenant-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: shop }
+  template:
+    metadata:
+      labels: { app: shop }
+    spec:
+      containers:
+        - name: nginx
+          image: mgmt01:5000/poc/nginx:1.28.0-alpine
+          ports: [{ containerPort: 80 }]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop
+  namespace: tenant-a
+spec:
+  selector: { app: shop }
+  ports: [{ port: 80, targetPort: 80 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  namespace: tenant-a
+  annotations:
+    external-dns.alpha.kubernetes.io/controller: ignore   # ★ ExternalDNS 제외 → DNS 작업 0건 (와일드카드에 의존)
+spec:
+  ingressClassName: neocloud
+  rules:
+    - host: shop.tenant-a.poc.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: shop
+                port: { number: 80 }
