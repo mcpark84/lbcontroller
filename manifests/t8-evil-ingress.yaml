@@ -1,0 +1,22 @@
+# T8 — domain-filter 경계 검증. tenant-a 네임스페이스에서 tenant-b 도메인을 참칭하는 Ingress.
+#  기대: tenant-a ExternalDNS(--domain-filter=tenant-a.poc.internal) 는 미등록 ("does not match domain filter")
+#  관찰: tenant-b ExternalDNS 는 같은 클러스터를 보고 있으므로 등록할 수 있음 → 운영(테넌트당 클러스터)과의 차이 기록
+# 적용/정리:  kubectl apply -f manifests/t8-evil-ingress.yaml  /  kubectl delete -f manifests/t8-evil-ingress.yaml
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: evil
+  namespace: tenant-a
+spec:
+  ingressClassName: neocloud
+  rules:
+    - host: evil.tenant-b.poc.internal   # ★ 타 테넌트 도메인
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port: { number: 80 }
