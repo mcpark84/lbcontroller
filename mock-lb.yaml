@@ -1,0 +1,131 @@
+# mock LB 컨트롤러 — CIS 의 write-back 동작만 모사
+# 적용:  kubectl apply -f mock-lb.yaml
+# 확인:  kubectl -n poc-lb logs -f deploy/mock-lb
+# 중지:  kubectl -n poc-lb scale deploy/mock-lb --replicas=0     (T11 무증상 실패 재현용)
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: poc-lb
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mock-lb
+  namespace: poc-lb
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mock-lb
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]          # spec 은 읽기만
+  - apiGroups: [""]
+    resources: ["services/status"]           # ★ 이 블록이 없으면 403
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mock-lb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mock-lb
+subjects:
+  - kind: ServiceAccount
+    name: mock-lb
+    namespace: poc-lb
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-lb-src
+  namespace: poc-lb
+data:
+  mock_lb.py: |
+    """CIS 대체 mock. type=LoadBalancer + 지정 loadBalancerClass 인 Service 의
+       status.loadBalancer.ingress 에 고정 VIP 를 기록한다.
+       표준 라이브러리만 사용 — pip 설치 불필요(폐쇄망 대응)."""
+    import json, os, ssl, time, urllib.request
+
+    API   = "https://kubernetes.default.svc"
+    SA    = "/var/run/secrets/kubernetes.io/serviceaccount"
+    TOKEN = open(f"{SA}/token").read().strip()
+    CTX   = ssl.create_default_context(cafile=f"{SA}/ca.crt")
+
+    VIP   = os.getenv("MOCK_VIP",  "10.10.0.100")
+    LBCLS = os.getenv("LB_CLASS",  "neocloud.poc/mock")
+    FIELD = os.getenv("VIP_FIELD", "ip")        # T14 에서 hostname 으로 전환
+
+    def call(path, method="GET", body=None, ctype="application/json"):
+        data = json.dumps(body).encode() if body is not None else None
+        r = urllib.request.Request(API + path, data=data, method=method)
+        r.add_header("Authorization", "Bearer " + TOKEN)
+        if data:
+            r.add_header("Content-Type", ctype)
+        return urllib.request.urlopen(r, context=CTX, timeout=600)
+
+    def write_back(ns, name):
+        body = {"status": {"loadBalancer": {"ingress": [{FIELD: VIP}]}}}
+        call(f"/api/v1/namespaces/{ns}/services/{name}/status",
+             "PATCH", body, "application/merge-patch+json").read()
+        print(f"[write-back] {ns}/{name} -> {FIELD}={VIP}", flush=True)
+
+    print(f"[start] class={LBCLS} vip={VIP} field={FIELD}", flush=True)
+    while True:
+        try:
+            with call("/api/v1/services?watch=true&timeoutSeconds=300") as stream:
+                for line in stream:
+                    if not line.strip():
+                        continue
+                    ev   = json.loads(line)
+                    svc  = ev.get("object") or {}
+                    if svc.get("kind") == "Status" or ev.get("type") == "DELETED":
+                        continue
+                    spec = svc.get("spec") or {}
+                    if spec.get("type") != "LoadBalancer":
+                        continue
+                    if spec.get("loadBalancerClass") != LBCLS:   # ★ 미지정 Service 는 조용히 건너뜀
+                        continue
+                    md  = svc["metadata"]
+                    cur = ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+                    if cur and cur[0].get(FIELD) == VIP:         # 멱등
+                        continue
+                    write_back(md["namespace"], md["name"])
+        except Exception as e:
+            print(f"[retry] {type(e).__name__}: {e}", flush=True)
+            time.sleep(2)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-lb
+  namespace: poc-lb
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mock-lb }
+  template:
+    metadata:
+      labels: { app: mock-lb }
+    spec:
+      serviceAccountName: mock-lb
+      containers:
+        - name: mock-lb
+          image: python:3.12-slim          # pip 설치 없음 — 표준 라이브러리만 사용
+          command: ["python", "-u", "/app/mock_lb.py"]
+          env:
+            - { name: MOCK_VIP,  value: "10.10.0.100" }
+            - { name: LB_CLASS,  value: "neocloud.poc/mock" }
+            - { name: VIP_FIELD, value: "ip" }      # T14 에서 "hostname" 으로 변경
+          volumeMounts:
+            - { name: src, mountPath: /app }
+          resources:
+            requests: { cpu: 50m,  memory: 64Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+      volumes:
+        - name: src
+          configMap: { name: mock-lb-src }

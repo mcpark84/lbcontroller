@@ -1,0 +1,146 @@
+# T1 — BIND9 권한 DNS (poc-dns ns). rfc2136 동적 갱신 + TSIG.
+# 사전조건: scripts/t1-tsig-secret.sh 로 Secret poc-dns/externaldns-tsig 생성 (키는 git 에 두지 않음)
+# 적용:  kubectl apply -f manifests/bind9.yaml
+# 확인:  dig @<ClusterIP> SOA tenant-a.poc.internal
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: poc-dns
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bind9-conf
+  namespace: poc-dns
+data:
+  named.conf: |
+    options {
+        directory "/var/cache/bind";
+        listen-on { any; };
+        listen-on-v6 { none; };
+        allow-query { any; };
+        recursion no;
+        dnssec-validation no;
+        minimal-responses yes;
+    };
+
+    logging {
+        channel stdout { stderr; severity info; print-time yes; print-category yes; };
+        category default { stdout; };
+        category update  { stdout; };     # rfc2136 갱신 로그 (T6/T9/T10 관찰용)
+        category xfer-out { stdout; };    # AXFR 로그 (T2 관찰용)
+        category security { stdout; };
+    };
+
+    include "/etc/bind/keys/externaldns.key";   # key "externaldns" { ... }
+
+    zone "tenant-a.poc.internal" {
+        type master;
+        file "/var/lib/bind/tenant-a.zone";
+        allow-update   { key "externaldns"; };
+        allow-transfer { key "externaldns"; };   # ★ 누락 시 ExternalDNS 가 현재 상태를 못 읽어 중복 생성 반복
+    };
+
+    zone "tenant-b.poc.internal" {
+        type master;
+        file "/var/lib/bind/tenant-b.zone";
+        allow-update   { key "externaldns"; };
+        allow-transfer { key "externaldns"; };
+    };
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bind9-zones
+  namespace: poc-dns
+data:
+  tenant-a.zone: |
+    $TTL 60
+    $ORIGIN tenant-a.poc.internal.
+    @   IN SOA ns1.tenant-a.poc.internal. admin.poc.internal. (
+            2026100701 ; serial
+            3600       ; refresh
+            600        ; retry
+            86400      ; expire
+            60 )       ; negative TTL
+    @   IN NS  ns1.tenant-a.poc.internal.
+    ns1 IN A   10.10.0.53
+  tenant-b.zone: |
+    $TTL 60
+    $ORIGIN tenant-b.poc.internal.
+    @   IN SOA ns1.tenant-b.poc.internal. admin.poc.internal. (
+            2026100701 ; serial
+            3600       ; refresh
+            600        ; retry
+            86400      ; expire
+            60 )       ; negative TTL
+    @   IN NS  ns1.tenant-b.poc.internal.
+    ns1 IN A   10.10.0.53
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bind9
+  namespace: poc-dns
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: bind9 }
+  template:
+    metadata:
+      labels: { app: bind9 }
+    spec:
+      initContainers:
+        # zone 파일은 동적 갱신으로 쓰기가 발생하므로 ConfigMap(read-only) 을 emptyDir 로 복사
+        - name: init-zones
+          image: internetsystemsconsortium/bind9:9.18
+          command: ["sh", "-c", "cp /zones-src/*.zone /var/lib/bind/ && chown -R bind:bind /var/lib/bind && named-checkconf /etc/bind/conf/named.conf && echo conf-ok"]
+          volumeMounts:
+            - { name: zones-src, mountPath: /zones-src }
+            - { name: zones,     mountPath: /var/lib/bind }
+            - { name: conf,      mountPath: /etc/bind/conf }
+            - { name: keys,      mountPath: /etc/bind/keys }
+      containers:
+        - name: bind9
+          image: internetsystemsconsortium/bind9:9.18
+          command: ["/usr/sbin/named", "-g", "-c", "/etc/bind/conf/named.conf", "-u", "bind"]
+          ports:
+            - { name: dns-udp, containerPort: 53, protocol: UDP }
+            - { name: dns-tcp, containerPort: 53, protocol: TCP }
+          volumeMounts:
+            - { name: conf,  mountPath: /etc/bind/conf }
+            - { name: keys,  mountPath: /etc/bind/keys }
+            - { name: zones, mountPath: /var/lib/bind }
+            - { name: cache, mountPath: /var/cache/bind }
+          readinessProbe:
+            tcpSocket: { port: 53 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m,  memory: 64Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: conf
+          configMap: { name: bind9-conf }
+        - name: zones-src
+          configMap: { name: bind9-zones }
+        - name: keys
+          secret: { secretName: externaldns-tsig }
+        - name: zones
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bind9
+  namespace: poc-dns
+spec:
+  type: ClusterIP
+  selector: { app: bind9 }
+  ports:
+    - { name: dns-udp, port: 53, targetPort: 53, protocol: UDP }
+    - { name: dns-tcp, port: 53, targetPort: 53, protocol: TCP }
