@@ -293,3 +293,65 @@ $ dig @10.233.18.38 TXT web.tenant-a.poc.internal +short
 - **지연의 구성.** 6.4초 중 NIC 처리 ~0.3초, ExternalDNS 의 이벤트 반응 + rfc2136 전송 ~5초. `--events` 가 없으면 `--interval=1m` 까지 늘어남. T7 은 1회 측정값이며 반복 측정 시 ±수 초 변동 예상.
 - **Ingress 패턴의 IP 효율.** 앱 Service 가 ClusterIP 이므로 테넌트 앱이 늘어나도 VIP 는 NIC Service 1개분만 소모. 시나리오 B(§3) 와의 핵심 차이.
 - 현재 상태: tenant-a 의 web Deployment/Service/Ingress 와 DNS 레코드는 **유지 중** (T8~T12 에서 재사용).
+
+---
+
+## 9. T8 — `--domain-filter` 경계 (멀티테넌시 통제)
+
+> 시험일: 2026-10-07 09:38 ~ 09:40 UTC / 매니페스트 `manifests/t8-evil-ingress.yaml`
+
+### 9.1 시험 내용
+
+tenant-a 네임스페이스에 **타 테넌트 도메인**을 host 로 갖는 Ingress 생성.
+
+```yaml
+kind: Ingress
+metadata: { name: evil, namespace: tenant-a }
+spec:
+  ingressClassName: neocloud
+  rules:
+    - host: evil.tenant-b.poc.internal     # tenant-a 가 tenant-b 도메인을 참칭
+```
+
+### 9.2 결과 (보정 전 — 두 ExternalDNS 모두 전 네임스페이스 감시 상태)
+
+| 관찰 대상 | 결과 |
+|---|---|
+| NIC | Ingress 수락, ADDRESS `10.10.0.100` 기록. **NIC 은 host 값을 검사하지 않음** |
+| tenant-a ExternalDNS (`--domain-filter=tenant-a.poc.internal`) | `ignoring record evil.tenant-b.poc.internal that does not match domain filter` → tenant-a 존 미등록 |
+| tenant-b ExternalDNS (`--domain-filter=tenant-b.poc.internal`) | `Adding RR: evil.tenant-b.poc.internal 60 A 10.10.0.100` → **tenant-b 존에 등록됨** |
+
+```
+$ dig @10.233.18.38 evil.tenant-a.poc.internal +short     → (없음)
+$ dig @10.233.18.38 evil.tenant-b.poc.internal +short     → 10.10.0.100
+$ dig @10.233.18.38 TXT evil.tenant-b.poc.internal +short
+"heritage=external-dns,external-dns/owner=tenant-b-cluster,external-dns/resource=ingress/tenant-a/evil"
+```
+
+TXT 의 `resource=ingress/tenant-a/evil` 이 "tenant-b 존의 레코드가 tenant-a 의 리소스에서 비롯됨" 을 그대로 보여줌.
+
+### 9.3 보정 — 운영 구성(테넌트당 클러스터) 모사
+
+운영에서는 tenant-b 의 ExternalDNS 가 tenant-b 클러스터 안에 있어 tenant-a 의 Ingress 를 볼 수 없음. 한 클러스터 PoC 에서 이를 모사하기 위해 각 인스턴스에 `--namespace=<자기 테넌트>` 추가 (`manifests/external-dns.yaml`).
+
+재배포(09:39:10) 직후 tenant-b 인스턴스가 `--policy=sync` 로 자기 소유 evil 레코드를 즉시 회수:
+```
+09:39:11 Removing RR: evil.tenant-b.poc.internal 60 A 10.10.0.100
+09:39:11 Removing RR: evil.tenant-b.poc.internal 0 TXT "...owner=tenant-b-cluster..."
+09:39:11 Removing RR: a-evil.tenant-b.poc.internal 0 TXT "..."
+```
+tenant-a 의 `web.tenant-a.poc.internal` 은 영향 없이 유지. evil Ingress 삭제 후 tenant-b 존은 초기 상태(NS, ns1)로 복귀.
+
+### 9.4 판정
+
+| # | 항목 | 합격 기준 | 결과 | 판정 |
+|---|---|---|---|---|
+| T8 | `--domain-filter` 경계 | tenant-a ExternalDNS 가 타 테넌트 host 를 미등록 | `does not match domain filter` 로 거부 | **합격** |
+
+### 9.5 설계 시사점 (★ G2 핵심 산출물)
+
+- **`--domain-filter` 는 "이 인스턴스가 어느 존에 쓰는가" 만 제한한다.** "누가 그 이름을 요구할 수 있는가" 는 걸러주지 않는다. 같은 클러스터에 두 인스턴스가 있으면 tenant-a 의 Ingress 가 tenant-b 존을 차지할 수 있음(9.2 로 실증).
+- **도메인 보안의 실제 경계 = "어느 클러스터의 ExternalDNS 가 어느 존의 쓰기 키를 갖는가".** 설계 덱의 "도메인 보안은 설정으로 달성" 은 **클러스터 분리와 결합될 때만** 성립.
+- 공유 클러스터에서 테넌트를 나눠야 한다면 `--namespace` 또는 `--label-filter` 가 필수. 추가로 BIND 측에서 **존별 TSIG 키 분리**(현재 PoC 는 키 1개를 두 존이 공유)를 해야 ExternalDNS 오설정 시에도 DNS 서버가 2차로 막아줌.
+- NIC 은 host 를 검증하지 않으므로 Ingress 단계에서 막으려면 별도 어드미션 정책(예: Kyverno/Gatekeeper 로 네임스페이스별 허용 도메인 접미사 강제)이 필요.
+- 이 보정(`--namespace`)은 T9 의 전제. tenant-b 인스턴스가 tenant-a 의 Ingress 를 **못 봐야** "내 소유 레코드인데 소스에 없다 → 삭제" 라는 T9 사고가 재현됨.
