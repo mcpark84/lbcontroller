@@ -439,3 +439,60 @@ BIND9 로그 (누가 썼는지 Pod IP 로 식별. .45 = tenant-b, .5 = tenant-a)
 - T8 과 결합하면: `--domain-filter` 를 넓게(상위 도메인) 주는 운영이 owner-id 충돌과 만나면 피해 범위가 전 테넌트로 확대. **domain-filter 는 가능한 좁게**(테넌트 존 단위) 유지해야 피해를 격리할 수 있음.
 - 2차 방어: BIND 측 **존별 TSIG 키 분리**. tenant-b 의 키로 tenant-a 존을 못 쓰게 하면 ExternalDNS 오설정이 있어도 DNS 서버가 거부(`REFUSED`). 현재 PoC 는 키 1개 공유라 이 방어가 없음. 운영 DNS 요건에 반영 필요.
 - 탐지 수단 후보: ExternalDNS 로그의 `Delete: N` 이 **매 interval 마다 같은 레코드에 반복** 되는 패턴, 또는 DNS 서버 측 동일 RR 의 add/delete 반복. 운영 런북(§ T11 산출물)에 포함할 것.
+
+---
+
+## 11. T10 — 삭제 동기화 (Ingress 삭제 → A/TXT 소멸)
+
+> 시험일: 2026-10-07 22:55 UTC (= 10-08 07:55 KST) / 대상 `tenant-a/web` Ingress (T5 생성, 13시간 유지)
+
+### 11.1 사전 상태
+
+```
+NAME   CLASS      HOSTS                       ADDRESS       PORTS   AGE
+web    neocloud   web.tenant-a.poc.internal   10.10.0.100   80      13h
+```
+존: `web A 10.10.0.100` + TXT `web` + TXT `a-web` (owner=tenant-a-cluster) 3건 존재.
+
+### 11.2 결과
+
+Ingress 삭제 22:55:35.262 → **6.4초 후 A / TXT / a-TXT 3건 동시 소멸.**
+
+```
+22:55:35 A=10.10.0.100 TXT=있음 a-TXT=있음      ← 삭제 직후
+22:55:41 A/TXT/TXT 모두 소멸 (+6.4s)
+```
+
+ExternalDNS tenant-a 로그:
+```
+22:55:41 ApplyChanges (Create: 0, UpdateOld: 0, UpdateNew: 0, Delete: 3)
+22:55:41 Removing RR: web.tenant-a.poc.internal 60 A 10.10.0.100
+22:55:41 Removing RR: web.tenant-a.poc.internal 0 TXT "...owner=tenant-a-cluster,...resource=ingress/tenant-a/web"
+22:55:41 Removing RR: a-web.tenant-a.poc.internal 0 TXT "..."
+```
+BIND9 로그: 같은 초에 `deleting an RR` 3건 (단일 rfc2136 트랜잭션).
+
+삭제 후 존 전체(AXFR): NS, ns1 만 남음. **잔여 레코드 0건.**
+
+재생성(T11/T12 재사용 목적) 22:55:41.863 → 22:55:47 A 재등록. **T7 2회차 측정 5.4초** (1회차 6.4초).
+
+### 11.3 판정
+
+| # | 항목 | 합격 기준 | 결과 | 판정 |
+|---|---|---|---|---|
+| T10 | 삭제 동기화 | Ingress 삭제 후 1분 내 A + TXT 동시 소멸 | 6.4초, 3건 단일 트랜잭션 | **합격** |
+| T7 (누적) | 반영 지연 | 60초 이내 | 1회차 6.4s / 2회차 5.4s | 합격 |
+
+### 11.4 비고
+
+- A 와 소유권 TXT 가 **한 트랜잭션으로** 지워지므로 "A 는 사라졌는데 TXT 가 남아 다음 생성을 막는" 고아 상태가 생기지 않음. 운영에서 레코드 누적을 걱정할 지점은 ExternalDNS 쪽이 아니라 **ExternalDNS 가 죽어 있는 동안 삭제된 리소스** (복구 후 sync 루프가 정리하는지는 T11 과 연관).
+- 생성(5~6s)과 삭제(6s)의 지연이 거의 같음 → `--events` 가 삭제 이벤트에도 즉시 반응.
+
+### 11.5 환경 이슈 (13시간 운영 중 발견)
+
+| Pod | 재시작 | 원인 | 조치 |
+|---|---|---|---|
+| bind9 | 2회 (OOMKilled, exit 137, 마지막 13:55 UTC) | 288 CPU 노드에서 named 가 워커 스레드/UDP 리스너를 **288개** 자동 생성 → 메모리 한도 256Mi 초과 | `named -n 2 -U 2` 로 스레드 수 제한 + 한도 512Mi (`manifests/bind9.yaml`) |
+| external-dns-tenant-a | 2회 (exit 1, 09:54 UTC) | bind9 재시작 순간 AXFR 접속 거부 → 기동 시 run-once 가 `fatal` 종료 | 조치 불필요. K8s 가 재시작해 자동 복구. **ExternalDNS 는 DNS 서버 불가 시 crash-loop 로 드러난다** (조용히 멈추지 않음) → 모니터링 포인트 |
+
+- bind9 가 컨테이너 재시작(Pod 재생성 아님)이었기 때문에 emptyDir 의 존 저널이 보존되어 레코드가 유지됨. **Pod 가 재생성되면 존은 ConfigMap 초기 상태로 리셋**되며, 다음 ExternalDNS 루프(≤1분)가 레코드를 재생성함. PoC 에서는 허용. 운영 DNS 는 영속 스토리지가 있으므로 해당 없음.

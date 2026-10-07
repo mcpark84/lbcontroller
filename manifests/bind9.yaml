@@ -105,7 +105,7 @@ spec:
       containers:
         - name: bind9
           image: mgmt01:5000/poc/bind9:9.18   # dev001 은 외부 레지스트리 접근 불가 → mgmt01:5000 경유
-          command: ["/usr/sbin/named", "-g", "-c", "/etc/bind/conf/named.conf", "-u", "bind"]
+          command: ["/usr/sbin/named", "-g", "-c", "/etc/bind/conf/named.conf", "-u", "bind", "-n", "2", "-U", "2"]   # -n/-U: 워커/UDP리스너 수 제한 (288 CPU 노드에서 자동값 288 → OOM)
           ports:
             - { name: dns-udp, containerPort: 53, protocol: UDP }
             - { name: dns-tcp, containerPort: 53, protocol: TCP }
@@ -120,7 +120,7 @@ spec:
             periodSeconds: 5
           resources:
             requests: { cpu: 50m,  memory: 64Mi }
-            limits:   { cpu: 500m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
       volumes:
         - name: conf
           configMap: { name: bind9-conf }
