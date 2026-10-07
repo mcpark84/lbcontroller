@@ -1,0 +1,33 @@
+# T4 — F5 NGINX Ingress Controller (OSS) helm values
+# chart: nginx-stable/nginx-ingress 2.7.3 (app 5.6.3)
+# 설치: scripts/t4-install-nic.sh
+controller:
+  kind: deployment
+  replicaCount: 1
+  nginxplus: false
+  image:
+    repository: mgmt01:5000/poc/nginx-ingress     # 사설 레지스트리 경유 (dev001 외부 불가)
+    tag: "5.6.3"
+  ingressClass:
+    name: neocloud
+    create: true
+    setAsDefaultIngress: false
+  enableCustomResources: false                     # VirtualServer CRD 끔 → 표준 Ingress 경로만 검증
+  enableSnippets: false
+  service:
+    create: true
+    type: LoadBalancer
+    loadBalancerClass: neocloud.poc/mock           # ★ mock 컨트롤러 처리 조건 (immutable)
+    externalTrafficPolicy: Local                   # 차트 기본값 유지 → healthCheckNodePort 자동 할당 (T16)
+    annotations: {}
+      # 운영 전환 시 CIS 용 어노테이션 자리:
+      # cis.f5.com/ipamLabel: <label>
+  reportIngressStatus:
+    enable: true                                   # ★ write-back ② 의 실체 — 자기 Service VIP 를 Ingress.status 로 복사
+    enableLeaderElection: true
+  logLevel: info
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: 500m, memory: 256Mi }
+prometheus:
+  create: false
