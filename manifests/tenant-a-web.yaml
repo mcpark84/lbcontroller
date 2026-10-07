@@ -1,0 +1,60 @@
+# T5 — tenant-a 앱 + Service(ClusterIP) + Ingress
+#  write-back ②: NIC 이 자기 Service 의 VIP(10.10.0.100) 를 이 Ingress 의 status 로 복사 → kubectl get ingress ADDRESS
+#  T6: ExternalDNS tenant-a 가 Ingress host 를 읽어 web.tenant-a.poc.internal A 레코드 생성
+# 적용:  kubectl apply -f manifests/tenant-a-web.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-a
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: tenant-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: web }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      containers:
+        - name: nginx
+          image: mgmt01:5000/poc/nginx:1.28.0-alpine
+          ports:
+            - { containerPort: 80 }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: tenant-a
+spec:
+  type: ClusterIP                      # 앱 Service 는 ClusterIP — VIP 는 NIC 의 Service 하나가 공유
+  selector: { app: web }
+  ports:
+    - { port: 80, targetPort: 80 }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  namespace: tenant-a
+spec:
+  ingressClassName: neocloud           # NIC 의 IngressClass
+  rules:
+    - host: web.tenant-a.poc.internal  # ★ ExternalDNS 가 이 값을 레코드 이름으로 사용
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port: { number: 80 }
