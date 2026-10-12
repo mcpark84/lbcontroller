@@ -1,0 +1,13 @@
+# Minimal audit policy for the authn PoC: record only PoC identities.
+# Failed authentications (401) carry no user and therefore match the final
+# None rule; those are tracked in the webhook server's own log instead.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - RequestReceived
+rules:
+  - level: Metadata
+    users: ["poc-user"]
+  - level: Metadata
+    userGroups: ["poc-tenant-a", "poc-tenant-b"]
+  - level: None

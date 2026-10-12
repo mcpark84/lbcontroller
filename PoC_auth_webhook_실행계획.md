@@ -39,7 +39,7 @@
 | `/etc/kubernetes/manifests/kube-apiserver.yaml` | 플래그 8개 + volume/mount 2쌍 | `~/kube-apiserver.yaml.bak` 복원 |
 | `~/kube-apiserver.yaml.bak` | 원본 백업 (매니페스트 디렉터리 **밖**) | 2차 종료 후 삭제 |
 | `~/poc-authn/` | 웹훅 로그, 토큰 kubeconfig | 삭제 |
-| 클러스터 | ClusterRoleBinding `poc-authn-view` (group `poc-tenant-a` → ClusterRole `view`) | `kubectl delete` |
+| 클러스터 | ClusterRole + ClusterRoleBinding `poc-authn-node-reader` (group `poc-tenant-a` → nodes get/list/watch) | `kubectl delete` |
 
 **apiserver 추가 플래그**
 ```yaml
@@ -95,7 +95,7 @@ rules:
 | `authn/scripts/w3-make-token-kubeconfig.sh` | admin.conf 에서 CA 추출해 토큰 kubeconfig 생성 |
 | `authn/scripts/w2-render-apiserver.py` | 원본 매니페스트를 읽어 플래그/볼륨을 삽입한 **새 파일** 생성 (원본 미수정) + YAML 파싱 검증 |
 | `authn/scripts/w2-watch-readyz.sh` | 적용 전후 `/readyz` 1초 폴링으로 다운타임 측정 |
-| `authn/rbac/poc-tenant-a-view.yaml` | A5 ClusterRoleBinding |
+| `authn/rbac/poc-authn-node-reader.yaml` | A5 ClusterRole(nodes get/list/watch) + ClusterRoleBinding(group poc-tenant-a). `view` 는 nodes 권한이 없어 대체 |
 
 ## 4. 단계와 체크포인트
 
@@ -110,7 +110,7 @@ rules:
 | **S4** | `w2-render-apiserver.py` 로 새 매니페스트 **별도 파일** 생성. 사전 검증 4종: YAML 파싱 / 플래그명 존재(`kube-apiserver --help` 대조) / 참조 파일 존재 / 웹훅 응답. **diff 를 보여 드림** | 없음 (파일 생성만) | ✋✋ **적용 승인** | diff 가 플래그 8개 + 볼륨 2쌍 뿐 |
 | **S5 = A1, A2** | 감시 세션에서 `w2-watch-readyz.sh` 시작 → 작업 세션에서 `cp` 적용 → kubelet 재기동 대기 → `crictl ps` / `/readyz` / admin `get nodes` | **apiserver** | (S4 승인에 포함) | crash-loop 없음, **다운타임 초 기록**, admin 경로 정상, 웹훅 로그 호출 없음 |
 | **S6 = A3, A4** | 토큰 kubeconfig 로 `get nodes` | 없음 | — | **403 + `User "poc-user"`** ★, 웹훅 로그에 토큰 앞 8자 일치 |
-| **S7 = A5** | `kubectl apply -f authn/rbac/poc-tenant-a-view.yaml` | 클러스터 RBAC | ✋ | `get nodes` **200** |
+| **S7 = A5** | `kubectl apply -f authn/rbac/poc-authn-node-reader.yaml` | 클러스터 RBAC | ✋ | `get nodes` **200**, `get pods -A` 는 여전히 403 |
 | **S8 = A6** | 웹훅을 `--groups poc-tenant-b` 로 재기동 → 재시도 → 원복 | 웹훅 프로세스 | — | 403 복귀 → 원복 후 200 |
 | **S9 = A7** | 기존 `poc-lb/mock-lb` Pod 에서 SA 토큰으로 in-cluster API 호출 | 없음 | — | 정상, 웹훅 로그 호출 없음 |
 | **S10 = A8** | 웹훅 `stop` → 토큰/admin/SA 세 경로 시도 → `start` | 웹훅 프로세스 | ✋ | 토큰만 401, admin/SA 정상, 재기동 후 복귀. apiserver 측 에러 로그 문구 기록 |

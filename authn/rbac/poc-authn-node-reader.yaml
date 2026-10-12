@@ -1,0 +1,24 @@
+# A5: grant the webhook-issued group read access to nodes only.
+# `get pods -A` must still return 403, proving RBAC scope applies to
+# webhook identities exactly as to any other user.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: poc-authn-node-reader
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: poc-authn-node-reader
+subjects:
+  - kind: Group
+    name: poc-tenant-a
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: poc-authn-node-reader
+  apiGroup: rbac.authorization.k8s.io
