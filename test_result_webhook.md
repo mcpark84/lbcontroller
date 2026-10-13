@@ -6,6 +6,34 @@
 
 ---
 
+## 배경 — 이 PoC 가 검증하는 Kubernetes 표준 동작
+
+**웹훅 토큰 인증은 Kubernetes 공식 기능이다.** apiserver 플래그 `--authentication-token-webhook-config-file` 로 켜며, 외부 서버에 TokenReview(`authentication.k8s.io/v1`) 를 보내 "이 토큰이 누구인가" 를 묻는 방식이다. 자체 패치가 아니라 OIDC 와 같은 급의 내장 인증기다.
+
+**자격 증명 종류에 따라 인증기가 갈린다.** kubeconfig 에 `client-certificate-data` 가 있으면 mTLS 로 x509 인증기(`--client-ca-file`)에서 끝나고, `token:` 이 있으면 kubectl 이 모든 요청에 `Authorization: Bearer <토큰>` 을 붙인다. kubectl 은 토큰이 무엇인지 모르고 문자열을 실어 보낼 뿐이다.
+
+**Bearer 토큰은 인증기 체인을 순서대로 거친다.** apiserver 도 토큰만 보고는 종류를 알 수 없어, 설정된 인증기에 차례로 묻는다. 각 인증기는 "내 것 아님 / 인증됨 / 내 것인데 무효" 중 하나로 답한다.
+
+| 순서 | 인증기 | 비고 |
+|---|---|---|
+| ① | 정적 토큰 파일 | 이 클러스터 미설정 |
+| ② | 부트스트랩 토큰 | 형식 불일치 시 통과 |
+| ③ | ServiceAccount 토큰(JWT) | **Pod 는 여기서 끝남** → 웹훅에 도달하지 않음 |
+| ④ | OIDC | 이 클러스터 미설정 |
+| ⑤ | **웹훅 TokenReview** | 앞에서 아무도 인정하지 않은 토큰만 도달 |
+
+**인증(authn)과 인가(authz)는 별개 단계다.** 요청은 인증 → 인가(RBAC) → 어드미션 순으로 처리된다. 웹훅이 `authenticated: true` 를 돌려줘도 그 username / group 에 RBAC 바인딩이 없으면 인가 단계에서 **403** 이 난다.
+
+| 응답 | 의미 |
+|---|---|
+| **401** Unauthorized | 누구인지 모름. 인증 실패 |
+| **403** Forbidden + `User "poc-user"` | **누구인지는 알겠는데** 권한이 없음. 인증 성공, 인가 실패 |
+| **200** | 인증 + 인가 통과 |
+
+따라서 **1차 PoC 의 성공 신호는 200 이 아니라 403** 이다. 401 → 403 전환이 "웹훅이 체인에 붙었다" 는 증거이고, 200 은 RBAC 을 추가로 넣은 뒤의 부가 확인이다.
+
+---
+
 ## 0. 사전 확인 (2026-10-12, 읽기 전용)
 
 | 항목 | 확인값 | 의미 |
@@ -25,6 +53,11 @@
 
 ## 1. S0 — 안전장치
 
+**배경**
+- apiserver 는 kubelet 이 `/etc/kubernetes/manifests/` 를 감시해 띄우는 정적 Pod 다. 파일을 고치면 kubelet 이 자동으로 재기동하므로 설정 오류 시 API 가 전면 중단되고 `kubectl` 도 같이 죽는다. 복구는 노드에서 파일을 되돌리는 것뿐이다
+- 백업을 같은 디렉터리에 두면 kubelet 이 **또 하나의 정적 Pod 매니페스트**로 인식한다. 반드시 디렉터리 밖에 둔다
+- 기존 admin kubeconfig 는 인증서 기반이라 웹훅과 무관하게 동작한다. PoC 중 유일한 복구 경로이므로 보존한다
+
 | 항목 | 결과 |
 |---|---|
 | 백업 | `~/kube-apiserver.yaml.bak` 4603 바이트, sha256 `a91b447d…197b`, 라이브와 diff 없음 |
@@ -36,6 +69,12 @@
 ---
 
 ## 2. S1 — 웹훅 서버 / 스크립트 (로컬 작업, 커밋 80fc526)
+
+**배경**
+- apiserver 의 웹훅 클라이언트는 **HTTPS 만** 허용한다. 평문 HTTP 서버는 설정 자체가 거부된다. 자체 서명 인증서를 만들고 그 인증서를 CA 로 등록하면 된다
+- 웹훅을 Pod 로 띄우면 "apiserver 가 뜨려면 웹훅이 필요하고, 웹훅 Pod 가 뜨려면 apiserver 가 필요한" 순환 의존이 생긴다. PoC 에서는 컨트롤 플레인 노드의 호스트 프로세스가 단순하다. apiserver Pod 는 `hostNetwork: true` 라 `127.0.0.1` 로 도달한다
+- TokenReview 응답의 `status` 에는 TTL 필드가 없다. 캐시 수명은 apiserver 플래그 `--authentication-token-webhook-cache-ttl` 이 단독 결정한다
+- `status.audiences` 는 요청의 `spec.audiences` 를 그대로 돌려준다. apiserver 는 자신의 audience 와 교집합이 없으면 인증을 거부하기 때문이다
 
 | 파일 | 역할 |
 |---|---|
@@ -69,6 +108,10 @@
 ---
 
 ## 3. S2 — 웹훅 기동 (mgmt01 호스트)
+
+**배경**
+- 이 단계는 서버를 띄워 둘 뿐 apiserver 는 아직 그 존재를 모른다. 기존 사용자 영향은 없다
+- apiserver 가 신뢰할 것은 `/etc/kubernetes/webhook/ca.crt` 하나다. 개인키는 apiserver 에 보여 줄 필요가 없으므로 웹훅 실행 계정의 홈에만 둔다
 
 ```
 $ bash authn/scripts/w1-setup-webhook.sh
@@ -107,6 +150,11 @@ apiserver 가 사용할 `/etc/kubernetes/webhook/ca.crt` 로 TokenReview 자가 
 
 ## 4. S3 = A0 — 설정 전 기준선
 
+**배경**
+- 웹훅이 아직 등록되지 않았으므로 `poc-token-0001` 은 체인 ①~④ 어디에서도 인정되지 않는다. 결과는 "누구인지 모름" = **401** 이어야 한다
+- `--anonymous-auth=True` 여도 401 이다. 익명 처리는 **자격 증명을 아예 제시하지 않았을 때**만 적용되고, 무효한 토큰을 제시하면 거부된다
+- 이 기준선이 있어야 S6 의 403 이 "웹훅 때문에 바뀐 것" 임을 말할 수 있다
+
 ```
 $ bash authn/scripts/w3-make-token-kubeconfig.sh poc-token-0001
 [w3] wrote /home/ubuntu/poc-authn/token.kubeconfig (server=https://172.16.1.120:6443 token=poc-toke...)
@@ -122,6 +170,12 @@ error: You must be logged in to the server (Unauthorized)      # rc=1
 ---
 
 ## 5. S4 — apiserver 매니페스트 렌더 / 사전 검증 (적용 전)
+
+**배경**
+- `--authentication-token-webhook-version` 기본값은 `v1beta1` 이다. 웹훅 서버가 v1 로 응답하므로 명시해야 한다
+- 플래그만 추가하고 **volume 마운트를 빠뜨리면** 컨테이너 안에서 설정 파일이 보이지 않아 apiserver 가 crash-loop 에 빠진다. 가장 흔한 실패이므로 렌더 스크립트가 플래그와 볼륨을 한 쌍으로 넣고, 참조 파일 존재까지 검사한다
+- `--authentication-token-webhook-cache-ttl=0s` 는 PoC 한정이다. 매 요청이 웹훅에 가므로 호출 여부를 로그로 바로 확인할 수 있다. 운영 값은 2차 B3 에서 실측해 정한다
+- 감사 로그는 apiserver 가 직접 파일로 쓰므로 정책 파일 마운트(읽기)와 로그 디렉터리 마운트(쓰기)가 둘 다 필요하다
 
 ```
 $ python3 authn/scripts/w2-render-apiserver.py ~/kube-apiserver.yaml.bak ~/poc-authn/kube-apiserver.new.yaml
@@ -185,6 +239,11 @@ $ python3 authn/scripts/w2-render-apiserver.py ~/kube-apiserver.yaml.bak ~/poc-a
 
 ## 7. S5 = A1, A2 — apiserver 적용 / 다운타임 / 인증서 경로 생존
 
+**배경**
+- 매니페스트를 바꾸면 kubelet 이 구 apiserver 를 graceful shutdown 한 뒤 새 컨테이너를 띄운다. 그동안 **인증서 / 토큰 구분 없이 모든 API 호출**이 실패한다. kubectl, 컨트롤러의 watch, 신규 스케줄링이 대상이다
+- 실행 중인 Pod 와 컨테이너, Pod 간 트래픽, Service / Ingress 데이터 평면은 apiserver 와 무관하므로 영향이 없다. 컨트롤러들은 재시도 로직으로 자동 복귀한다
+- 재기동 뒤 인증서 사용자가 웹훅과 무관함을 보이는 것이 A2 다. x509 인증기에서 끝나므로 웹훅 로그에 호출이 생기면 안 된다
+
 **적용 시각**: 2026-10-13T06:03:10.186Z (`sudo install -m 0600 ~/poc-authn/kube-apiserver.new.yaml /etc/kubernetes/manifests/kube-apiserver.yaml`)
 
 **A1 — 재기동 관측 (`/readyz` 1초 폴링, 비인증)**
@@ -216,6 +275,12 @@ mgmt01   Ready   control-plane   77d   v1.35.1
 ---
 
 ## 8. S6 = A3, A4 — 인증 성립 (401 → 403)
+
+**배경**
+- 이제 체인 ⑤ 에 웹훅이 있다. `poc-token-0001` 은 ①~④ 를 통과해 웹훅에 도달하고, 1차 웹훅은 아무 문자열이나 `poc-user` 로 답한다. apiserver 입장에서 이 토큰은 **완전히 유효**하다. `--token any-string` 으로 바꿔도 같은 결과가 나온다
+- 그러나 `poc-user` 와 그룹 `poc-tenant-a` 에는 아무 RBAC 바인딩이 없다. **인증은 통과하고 인가에서 막혀** 403 이 난다. 메시지에 `User "poc-user"` 가 박히는 것이 웹훅 신원을 apiserver 가 받아들였다는 증거다
+- admin kubeconfig 가 200 인 이유는 인증서의 O 필드가 `system:masters` 그룹이고 거기에 cluster-admin 이 기본 바인딩돼 있기 때문이다. 웹훅 신원도 같은 RBAC 규칙을 따른다는 것을 S7 에서 확인한다
+- apiserver 는 인증된 모든 사용자에게 `system:authenticated` 그룹을 자동으로 더한다
 
 ### 8.1 1차 시도 실패와 원인 (06:04:28Z)
 
