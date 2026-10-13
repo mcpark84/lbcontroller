@@ -1,0 +1,207 @@
+# PoC 시험 결과 — kubeconfig 토큰 인증 웹훅
+
+> 대상 클러스터: gasandevcontrol (mgmt01 컨트롤 플레인 단일 + dev001, K8s v1.35.1)
+> 시험일: 2026-10-13 (KST 13:00 전후, 로그 시각은 UTC) / 계획서 `PoC_auth_webook_plan.md`, 실행 계획 `PoC_auth_webhook_실행계획.md`
+> 진행 상태: **S0~S4 완료, S5(apiserver 적용) 대기 중**
+
+---
+
+## 0. 사전 확인 (2026-10-12, 읽기 전용)
+
+| 항목 | 확인값 | 의미 |
+|---|---|---|
+| 웹훅 슬롯 | `--authentication-token-webhook-*` 없음 | 비어 있음 |
+| 감사 로그 | `--audit-*` 없음, `/var/log/kubernetes` 없음 | A9 위해 신규 추가 |
+| 인증서 경로 | `--client-ca-file=/etc/kubernetes/ssl/ca.crt`, admin.conf 는 인증서 기반 | 복구 경로 |
+| audience | `--api-audiences` 없음 → issuer `https://kubernetes.default.svc.cluster.local` | 웹훅은 `spec.audiences` echo |
+| apiserver Pod | `hostNetwork: true`, `--secure-port=6443`, `--anonymous-auth=True` | `127.0.0.1:8443` 도달 가능 |
+| apiserver 기동 시각 | 2026-07-27T09:44:44Z (매니페스트 수정일과 동일, 77일 무변경) | |
+| 호스트 도구 | python3 3.12.3 / PyYAML 6.0.1 / openssl / crictl / ctr | |
+| 공유 사용 | `litellm`(전날 생성), `inferium`, `team-b`, `dynamo-system` 등 활성 | 재기동 전 공지 |
+
+**확정 결정**: 감사 로그를 웹훅과 같은 매니페스트 수정 1회에 포함 / A10 롤백은 2차 종료 후 / 웹훅은 nohup 호스트 프로세스 / 캐시 TTL `0s`.
+
+---
+
+## 1. S0 — 안전장치
+
+| 항목 | 결과 |
+|---|---|
+| 백업 | `~/kube-apiserver.yaml.bak` 4603 바이트, sha256 `a91b447d…197b`, 라이브와 diff 없음 |
+| 위치 | `/etc/kubernetes/manifests/` 밖 (홈 디렉터리). kubelet 중복 인식 없음 |
+| 저장소 | mgmt01 `~/lbcontroller` 를 git pull 로 동기 |
+
+**판정: 합격.**
+
+---
+
+## 2. S1 — 웹훅 서버 / 스크립트 (로컬 작업, 커밋 80fc526)
+
+| 파일 | 역할 |
+|---|---|
+| `authn/webhook_server.py` | 1차 allow-all TokenReview 웹훅. python 표준 라이브러리, HTTPS 전용, `POST /authenticate`, `GET /healthz` |
+| `authn/webhook-kubeconfig.yaml` | apiserver → 웹훅 접속 설정 |
+| `authn/audit-policy.yaml` | poc 신원만 Metadata, 나머지 None |
+| `authn/rbac/poc-authn-node-reader.yaml` | A5 용 ClusterRole(nodes get/list/watch) + 그룹 바인딩 |
+| `authn/scripts/w1-setup-webhook.sh` | 인증서 생성 + `/etc/kubernetes/webhook` 구성 |
+| `authn/scripts/w1-run-webhook.sh` | nohup start / stop / status |
+| `authn/scripts/w3-make-token-kubeconfig.sh` | 토큰 kubeconfig 생성 |
+| `authn/scripts/w2-render-apiserver.py` | 새 매니페스트 렌더 + 검증 (원본 미수정) |
+| `authn/scripts/w2-watch-readyz.sh` | `/readyz` 1초 폴링, 다운타임 측정 |
+
+**로컬 자가 시험 (macOS, 포트 18443)**
+
+| 요청 | 응답 |
+|---|---|
+| `GET /healthz` | 200 `{"status":"ok","mode":"allow-all",…}` |
+| TokenReview (apiserver 와 같은 형태, audiences 포함) | `authenticated: true`, user `poc-user` / `poc-1` / `[poc-tenant-a]`, `status.audiences` 요청값 echo |
+| 빈 토큰 | `authenticated: false`, `error: empty token` |
+| `/other` 경로 | 404, 로그 없음 |
+| 평문 HTTP | TLS 핸드셰이크 실패 (curl rc=56) |
+| 로그 | 요청당 1행: 시각 / addr / 토큰 앞 8자 / auds / 결과 / user / groups / ms |
+
+**렌더 스크립트 (백업 매니페스트 대상)**: +12줄, PyYAML 재파싱 정상(command 50개, volumes 8, mounts 8), 이미 적용된 파일에 재실행 시 거부.
+
+> 계획 보정: `view` ClusterRole 은 nodes 권한이 없어 A5 는 `poc-authn-node-reader` 로 대체. `get pods -A` 가 여전히 403 인 것으로 권한 범위를 함께 확인.
+
+**판정: 합격.**
+
+---
+
+## 3. S2 — 웹훅 기동 (mgmt01 호스트)
+
+```
+$ bash authn/scripts/w1-setup-webhook.sh
+[w1] generated /home/ubuntu/poc-authn/tls/tls.crt
+/etc/kubernetes/webhook:
+-rw-r--r-- root root  426 audit-policy.yaml
+-rw-r--r-- root root 1159 ca.crt
+-rw-r--r-- root root  574 webhook-kubeconfig.yaml
+subject=CN = poc-authn-webhook  notBefore=Oct 13 04:17:04 2026  notAfter=Oct 13 04:17:04 2027
+X509v3 Subject Alternative Name: IP Address:127.0.0.1
+
+$ bash authn/scripts/w1-run-webhook.sh start
+[w1] running pid 113484, started Tue Oct 13 04:17:04 2026
+{"status": "ok", "mode": "allow-all", "username": "poc-user", "groups": ["poc-tenant-a"]}
+```
+
+apiserver 가 사용할 `/etc/kubernetes/webhook/ca.crt` 로 TokenReview 자가 시험:
+```
+{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","status":{"authenticated":true,
+ "user":{"username":"poc-user","uid":"poc-1","groups":["poc-tenant-a"]},
+ "audiences":["https://kubernetes.default.svc.cluster.local"]}}
+```
+웹훅 로그:
+```
+2026-10-13T04:17:04 INFO [start] mode=allow-all bind=127.0.0.1:8443 username=poc-user uid=poc-1 groups=['poc-tenant-a']
+2026-10-13T04:17:05 INFO addr=127.0.0.1 token=poc-toke... len=14 auds=['https://kubernetes.default.svc.cluster.local'] authenticated=True user=poc-user groups=['poc-tenant-a'] ms=0.03
+```
+`ss -ltnp`: `127.0.0.1:8443 python3 pid=113484`.
+
+- 개인키는 `~/poc-authn/tls/tls.key` (ubuntu 소유 600). `/etc/kubernetes/webhook` 에는 공개 인증서만 둠
+- 이 시점까지 **기존 사용자 영향 없음** (apiserver 가 아직 웹훅을 호출하지 않음)
+
+**판정: 합격.**
+
+---
+
+## 4. S3 = A0 — 설정 전 기준선
+
+```
+$ bash authn/scripts/w3-make-token-kubeconfig.sh poc-token-0001
+[w3] wrote /home/ubuntu/poc-authn/token.kubeconfig (server=https://172.16.1.120:6443 token=poc-toke...)
+
+$ date -u; kubectl --kubeconfig ~/poc-authn/token.kubeconfig get nodes
+2026-10-13T04:17:22Z
+error: You must be logged in to the server (Unauthorized)      # rc=1
+```
+웹훅 로그 `authenticated=` 행 수: 1 (S2 자가 시험 1건뿐, 이 요청으로 인한 호출 없음).
+
+**판정: 합격 — 401 Unauthorized, 웹훅 미호출.** `--anonymous-auth=True` 여도 무효 토큰 제시 시에는 401.
+
+---
+
+## 5. S4 — apiserver 매니페스트 렌더 / 사전 검증 (적용 전)
+
+```
+$ python3 authn/scripts/w2-render-apiserver.py ~/kube-apiserver.yaml.bak ~/poc-authn/kube-apiserver.new.yaml
+[w2] wrote /home/ubuntu/poc-authn/kube-apiserver.new.yaml (+12 lines)
+[w2] yaml ok: 50 command args, 8 volumes, 8 mounts, hostNetwork=True
+[w2] host files present: [webhook-kubeconfig.yaml, ca.crt, audit-policy.yaml]
+```
+
+| 검증 | 결과 |
+|---|---|
+| YAML 재파싱 | 정상 |
+| 플래그명 8개가 `kube-apiserver v1.35.1 --help` 에 존재 | 전부 존재 (`ctr -n k8s.io run --rm registry.k8s.io/kube-apiserver:v1.35.1 … --help` 로 대조) |
+| `--authentication-token-webhook-version` 기본값 | **`v1beta1`** → `v1` 명시 필수 확인 |
+| 참조 호스트 파일 3개 | 존재 |
+| 감사 정책 / 웹훅 kubeconfig 파싱 | 정상 (`audit.k8s.io/v1 Policy` 3 rules / `server: https://127.0.0.1:8443/authenticate`) |
+| 라이브 매니페스트 vs 백업 | 동일 (아직 미적용) |
+
+**적용 예정 diff**
+```diff
+     - --event-ttl=1h0m0s
++    - --authentication-token-webhook-config-file=/etc/kubernetes/webhook/webhook-kubeconfig.yaml
++    - --authentication-token-webhook-version=v1
++    - --authentication-token-webhook-cache-ttl=0s
++    - --audit-policy-file=/etc/kubernetes/webhook/audit-policy.yaml
++    - --audit-log-path=/var/log/kubernetes/audit/audit.log
++    - --audit-log-maxage=3
++    - --audit-log-maxbackup=3
++    - --audit-log-maxsize=50
+     volumeMounts:
++    - mountPath: /etc/kubernetes/webhook
++      name: poc-webhook
++      readOnly: true
++    - mountPath: /var/log/kubernetes/audit
++      name: poc-audit
+   volumes:
++  - hostPath:
++      path: /etc/kubernetes/webhook
++      type: Directory
++    name: poc-webhook
++  - hostPath:
++      path: /var/log/kubernetes/audit
++      type: DirectoryOrCreate
++    name: poc-audit
+```
+
+**판정: 사전 검증 합격. 적용(S5)은 사용자 승인 대기.**
+
+---
+
+## 6. 영향 범위 정리 (S5 전 확인)
+
+| 단계 | 기존 사용자 영향 |
+|---|---|
+| S2~S4 | 없음 |
+| S5 적용 | **모든 API 호출 10~30초 중단** (kubelet 의 apiserver 재기동). 실행 중 Pod / 트래픽은 유지 |
+| S5 이후 | 없음. 인증서 사용자는 x509 인증기에서 끝나고 웹훅은 체인 마지막 |
+
+**S5 절차**: `/readyz` 폴링 시작 → `sudo cp ~/poc-authn/kube-apiserver.new.yaml /etc/kubernetes/manifests/kube-apiserver.yaml` → 90초 내 200 복귀 확인 → 실패 시 `sudo cp ~/kube-apiserver.yaml.bak /etc/kubernetes/manifests/kube-apiserver.yaml`.
+
+---
+
+## A. 판정 요약
+
+| 단계 | 항목 | 결과 |
+|---|---|---|
+| S0 | 백업 / 안전장치 | 합격 |
+| S1 | 웹훅 서버 / 스크립트 / 렌더 검증 | 합격 |
+| S2 | 웹훅 기동 (mgmt01) | 합격 |
+| S3 = A0 | 기준선 401, 웹훅 미호출 | 합격 |
+| S4 | 매니페스트 렌더 + 사전 검증 4종 | 합격 (적용 대기) |
+| S5 = A1, A2 | 적용 / 다운타임 / 인증서 경로 생존 | 미실시 |
+| S6~S11 = A3~A9 | | 미실시 |
+
+## B. 현재 호스트 / 클러스터 상태
+
+| 위치 | 상태 |
+|---|---|
+| `/etc/kubernetes/manifests/kube-apiserver.yaml` | **원본 그대로** |
+| `~/kube-apiserver.yaml.bak` | 원본 백업 |
+| `~/poc-authn/` | `tls/`, `webhook.log`, `webhook.pid`, `token.kubeconfig`, `kube-apiserver.new.yaml` |
+| `/etc/kubernetes/webhook/` | `ca.crt`, `webhook-kubeconfig.yaml`, `audit-policy.yaml` |
+| 웹훅 프로세스 | pid 113484, `127.0.0.1:8443`, nohup (재부팅 시 `w1-run-webhook.sh start` 로 수동 재기동) |
+| 클러스터 리소스 | 변경 없음 (RBAC 은 S7 에서 적용) |

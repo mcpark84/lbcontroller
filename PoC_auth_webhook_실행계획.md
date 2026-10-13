@@ -27,7 +27,7 @@
 | 롤백(A10) | **2차 끝으로 미룸.** 1차 종료 후에도 웹훅 설정 유지 | 재기동 2회 절감. 그 사이 웹훅 서버 상시 기동 유지 |
 | 웹훅 실행 | mgmt01 호스트 `nohup` 수동 실행 (systemd 미사용) | 시스템 파일 변경 최소화. **재부팅/세션 종료 시 수동 재기동 필요** |
 | 캐시 TTL | `0s` | 1차는 매 요청 웹훅 호출 확인이 목적 |
-| 산출물 위치 | `authn/` 폴더 + `test_result_authn.md` | ExternalDNS 산출물과 분리 |
+| 산출물 위치 | `authn/` 폴더 + `test_result_webhook.md` | ExternalDNS 산출물과 분리 |
 | 코드 전달 | 로컬 commit/push → mgmt01 `~/lbcontroller` git pull | 기존 방식 유지 |
 
 ## 2. 변경 범위 (호스트/클러스터에 남는 것)
@@ -115,7 +115,7 @@ rules:
 | **S9 = A7** | 기존 `poc-lb/mock-lb` Pod 에서 SA 토큰으로 in-cluster API 호출 | 없음 | — | 정상, 웹훅 로그 호출 없음 |
 | **S10 = A8** | 웹훅 `stop` → 토큰/admin/SA 세 경로 시도 → `start` | 웹훅 프로세스 | ✋ | 토큰만 401, admin/SA 정상, 재기동 후 복귀. apiserver 측 에러 로그 문구 기록 |
 | **S11 = A9** | `/var/log/kubernetes/audit/audit.log` 에서 `poc-user` 이벤트 확인 | 없음 | — | `user.username=poc-user`, `userAgent=kubectl`, 403/200 코드 기록 |
-| **S12** | `test_result_authn.md` 작성, commit/push | git | — | ExternalDNS 결과서와 같은 형식 |
+| **S12** | `test_result_webhook.md` 작성, commit/push | git | — | ExternalDNS 결과서와 같은 형식 |
 | ~~A10~~ | 롤백은 **2차 종료 후** 수행 (결정 §1) | | | |
 
 **S4~S5 롤백 절차 (실패 시 즉시)**
@@ -149,4 +149,4 @@ kubectl get --raw /readyz
 
 ## 7. 결과서 기록 형식
 
-`test_result_authn.md` — 항목별 §: 절차 / 시간순 로그 / 판정 / 설계 시사점. 마지막에 판정 요약표, 클러스터 잔존 상태, 산출물 위치. (`test_result.md` 와 동일 구조)
+`test_result_webhook.md` — 항목별 §: 절차 / 시간순 로그 / 판정 / 설계 시사점. 마지막에 판정 요약표, 클러스터 잔존 상태, 산출물 위치. (`test_result.md` 와 동일 구조)
