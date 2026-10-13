@@ -2,7 +2,7 @@
 
 > 대상 클러스터: gasandevcontrol (mgmt01 컨트롤 플레인 단일 + dev001, K8s v1.35.1)
 > 시험일: 2026-10-13 (KST 13:00 전후, 로그 시각은 UTC) / 계획서 `PoC_auth_webook_plan.md`, 실행 계획 `PoC_auth_webhook_실행계획.md`
-> 진행 상태: **S0~S9, S11 완료 (A0~A7, A9 합격), S10(A8 웹훅 중단) 대기 중**
+> 진행 상태: **1차 완료 (A0~A9 전부 합격, 2026-10-13). A10 롤백은 2차 종료 후 수행. 2차 미착수**
 
 ---
 
@@ -451,6 +451,106 @@ JWT 가 아닌 토큰은 ③ 을 통과해 웹훅에 도달하고, 1차 allow-al
 
 ---
 
+## 14. S10 = A8 — 웹훅 중단 시 영향 범위
+
+**배경**
+- 웹훅은 Bearer 토큰 체인의 마지막(⑤)이다. 웹훅이 죽으면 "⑤ 까지 와야 하는 토큰" 만 인증에 실패한다. 인증서 사용자(x509)와 SA 토큰(③)은 웹훅 이전에 끝나므로 영향이 없어야 한다
+- 이것이 설계의 "웹훅 장애 시 사람의 신규 인증만 차단" 주장이며, 운영 런북의 영향 범위 정의 근거다
+- 웹훅이 **빨리 거부**(connection refused)하는 경우와 **응답이 없는**(hang) 경우는 apiserver 의 체감이 다르다. 이번 시험은 프로세스 종료 = connection refused 다
+
+**절차 / 결과** (06:41:17Z 중단 → 06:41:32Z 재기동, 15초)
+
+| 시각(UTC) | 경로 | 결과 |
+|---|---|---|
+| 06:41:20 | 토큰 (중단 3초 후) | **401** `You must be logged in to the server (Unauthorized)` |
+| 06:41:31 | 토큰 (중단 14초 후) | **401**, 응답 **0.045초** (즉시 실패, 대기 없음) |
+| 06:41:31 | admin 인증서 | 정상 (`node/dev001`, `node/mgmt01`) |
+| 06:41:31 | Pod SA 토큰 | 정상 (`services` 200) |
+| 06:41:34 | 토큰 (재기동 2초 후) | **200** 복귀, 웹훅 로그 호출 기록 |
+
+> 중단 3초 후에도 캐시 통과가 없었던 것은 직전 토큰 사용이 06:30:38 로 10초 캐시가 이미 만료돼 있었기 때문이다. 캐시가 따뜻한 상태에서 중단하면 최대 10초간은 통과한다 (§10).
+
+**apiserver 로그 (런북용 에러 문구)**
+```
+E webhook.go:154] Failed to make webhook authenticator request: Post "https://127.0.0.1:8443/authenticate?timeout=30s": dial tcp 127.0.0.1:8443: connect: connection refused
+E authentication.go:75] "Unable to authenticate the request" err="[invalid bearer token, Post \"https://127.0.0.1:8443/authenticate?timeout=30s\": dial tcp 127.0.0.1:8443: connect: connection refused]"
+```
+클라이언트에는 원인이 전달되지 않는다. kubectl 은 `401 Unauthorized` 만 본다 (`-v=6`: `status="401 Unauthorized" milliseconds=2`).
+
+**판정: 합격.** 토큰 경로만 401, 인증서 / SA 경로 정상, 재기동 즉시 복귀.
+
+**설계 시사점**
+- 사용자는 "토큰이 잘못됐나" 로 오인한다. 런북은 **apiserver 로그의 `webhook.go` 행**으로 토큰 문제와 웹훅 장애를 구별하도록 써야 한다 (§C 런북 초안)
+- 이번 결과는 connection refused 한정이다. 웹훅 프로세스가 살아 있되 응답하지 않는 hang 상황에서는 요청마다 `timeout=30s` 와 재시도(backoff)가 걸려 **토큰 사용자 체감이 수십 초 지연**으로 바뀔 수 있다. 2차 B8 에서 `SIGSTOP` 으로 재현해 실측한다
+- 웹훅 서버는 **빠르게 실패**하도록 설계한다 (DB 조회 타임아웃 짧게, 헬스체크 실패 시 리스너 닫기). 느린 실패가 멈춘 것보다 나쁘다
+
+---
+
+## 15. 1차 종합
+
+### 15.1 목표 달성
+
+| 목표 | 결과 |
+|---|---|
+| **A1** 웹훅 인증기가 체인에 붙어 동작 (401 → 403 → 200) | **달성.** S3 401 → S6 403 → S7 200 |
+| **A2** 인증서 경로와 토큰 경로 공존 | **달성.** admin / SA 는 웹훅 미호출, 웹훅 중단에도 정상 |
+
+### 15.2 설계 / 운영에 반영할 결정 사항 (우선순위순)
+
+1. **취소 반영 하한 10초.** apiserver 전역 토큰 성공 캐시(플래그 없음)가 웹훅 TTL 과 별개로 10초 존재. 운영 문서에 "취소 후 최대 10초 + 웹훅 캐시 TTL 동안 기존 토큰 유효" 로 명시. 2차 B3 는 이 전제로 측정 (§10)
+2. **웹훅 서버 규격**: 경로는 쿼리 문자열 무시(`?timeout=30s` 가 붙음), 모든 응답 전 본문 소진, `status.audiences` 는 요청값 echo, TTL 필드 없음, HTTPS 필수, 빠른 실패 (§8, §14)
+3. **웹훅 = 클러스터 전체의 마지막 인증 방어선.** Pod 내부에서 보낸 임의 토큰도 도달한다. allow-all 상태로 운영 클러스터에 올리는 일은 금지. 2차 검증 로직이 곧 보안 경계 (§12)
+4. **apiserver → 웹훅 mTLS** (webhook-kubeconfig `users` 에 클라이언트 인증서) 는 1차 미적용. 운영 전 필수 (설계 단계)
+5. **감사 로그 정책**: poc 신원 Metadata 만으로도 인증 결과 / 인가 사유 / 소스 IP / UA 가 남아 K51 충족. 401 은 user 가 비어 정책에 안 걸리므로 인증 실패 추적은 웹훅 로그 책임 (§13)
+6. **apiserver 재기동 다운타임 약 40초** (graceful shutdown 30초 포함). 단일 컨트롤 플레인에서는 모든 API 호출 중단. 운영 적용은 HA 컨트롤 플레인에서 롤링으로 (§7)
+7. **자가 시험은 apiserver 와 같은 클라이언트 동작**(쿼리, keep-alive)으로. curl 단건은 §8 결함을 못 잡았다
+
+### 15.3 2차 계획 조정
+
+| 항목 | 조정 |
+|---|---|
+| B3 취소 즉시성 | 측정 기준선 = 10초 전역 캐시. TTL `0s` / `2m` 두 조건 모두 "취소 → 차단까지" 를 11초 이상 간격으로 샘플링 |
+| B8 웹훅 장애 | connection refused(완료) 외에 **hang** (`kill -STOP`) 추가. 토큰 사용자 체감 지연과 apiserver 재시도 횟수 실측 |
+| 신규 | apiserver → 웹훅 **mTLS** 적용 시험 (webhook-kubeconfig `users` 에 client cert, 웹훅 서버 `verify_mode=CERT_REQUIRED`) |
+| 신규 | 웹훅 호출 시 **토큰 해시 로그만** 남기는지 점검 (현재 1차는 앞 8자 평문) |
+| A10 롤백 | 2차 종료 후 수행. 재기동 1회 + 다운타임 재측정 |
+
+### 15.4 운영 환경과의 차이 (PoC 한계)
+
+- 컨트롤 플레인 단일 노드. HA 에서는 노드마다 웹훅 설정과 웹훅 도달성이 필요
+- 웹훅이 호스트 nohup 프로세스. 운영은 systemd 또는 외부 서비스 + 다중화
+- apiserver → 웹훅 TLS 가 단방향. mTLS 미적용
+- kubeadm/kubespray 매니페스트 직접 수정. **NKE 에서는 N1 / N2 (슬롯 비어 있는지, 주입 경로가 있는지) 확인 전까지 적용 가능성 미확정** — 계획서 §7
+- 1차 웹훅은 allow-all. 토큰 검증 / 발급 / 취소는 2차
+
+### 15.5 ★ 발견 요약 (설계 담당자용 한 줄 요약)
+
+| # | 발견 | 영향 |
+|---|---|---|
+| F1 | apiserver 전역 토큰 캐시 10초, 플래그로 불가 | 취소 즉시성 하한 10초 |
+| F2 | apiserver 는 `?timeout=30s` 를 붙여 호출 | 웹훅 규격 (경로 비교 / 처리 시간 예산) |
+| F3 | Pod 발 임의 토큰도 웹훅 도달 | 웹훅 검증 = 보안 경계 |
+| F4 | 웹훅 down 시 토큰 401 즉시, 원인은 apiserver 로그에만 | 런북 진단 포인트 |
+| F5 | 재기동 다운타임 약 40초, 전 API | 운영 적용은 HA 롤링 |
+
+---
+
+## C. 운영 런북 초안 — "토큰 kubeconfig 가 갑자기 Unauthorized"
+
+**증상**: 어제까지 되던 kubeconfig 로 `kubectl` 이 `You must be logged in to the server (Unauthorized)`. 인증서 사용자와 Pod 는 정상.
+
+| 순서 | 확인 | 판단 |
+|---|---|---|
+| 1 | 다른 토큰 사용자도 같은 증상인가 | 전원이면 웹훅 장애 의심, 1명이면 토큰 취소 / 만료 의심 |
+| 2 | apiserver 로그 `grep webhook.go` | `connection refused` / `timeout` / `x509` 가 보이면 **웹훅 장애** (토큰 문제 아님) |
+| 3 | 웹훅 측 로그에 해당 토큰 요청이 있나 | 있고 `authenticated=False` 면 토큰 문제, 없으면 경로 문제 |
+| 4 | 웹훅 헬스 (`/healthz`) 와 인증서 만료일 | 자체 서명 인증서 만료는 `x509: certificate has expired` 로 나타남 |
+| 5 | 복구 후 사용자는 **10초 뒤** 재시도 | 실패는 캐시되지 않으므로 즉시 재시도도 가능하나, 10초 룰로 안내가 단순 |
+
+**영향 범위 고지 문구**: "토큰 기반 사용자 로그인(신규 요청)만 영향. 실행 중 워크로드, 컨트롤러, 인증서 사용자는 영향 없음."
+
+---
+
 ## A. 판정 요약
 
 | 단계 | 항목 | 결과 |
@@ -468,7 +568,7 @@ JWT 가 아닌 토큰은 ③ 을 통과해 웹훅에 도달하고, 1차 allow-al
 | 발견 | 전역 토큰 성공 캐시 10초 (웹훅 TTL 0s 와 무관) | ★ B3 전제 수정 |
 | S8 = A6 | 그룹 변경 → 403, 복원 → 200 (10초 캐시 후 반영) | 합격 |
 | S9 = A7 | SA 토큰은 웹훅 미호출, SA RBAC 대로 동작 | 합격 |
-| S10 = A8 | 웹훅 중단 영향 | 미실시 |
+| S10 = A8 | 웹훅 중단 시 토큰만 401(즉시), 인증서 / SA 정상, 재기동 즉시 복귀 | 합격 |
 | S11 = A9 | 감사 로그에 poc-user / uid / groups / 인가 사유 기록 | 합격 |
 
 ## B. 현재 호스트 / 클러스터 상태
@@ -480,5 +580,19 @@ JWT 가 아닌 토큰은 ③ 을 통과해 웹훅에 도달하고, 1차 allow-al
 | `~/poc-authn/` | `tls/`, `webhook.log`, `webhook.pid`, `token.kubeconfig`, `kube-apiserver.new.yaml`, `readyz.log` |
 | `/var/log/kubernetes/audit/audit.log` | 생성됨 (root 600) |
 | `/etc/kubernetes/webhook/` | `ca.crt`, `webhook-kubeconfig.yaml`, `audit-policy.yaml` |
-| 웹훅 프로세스 | pid 304931, `127.0.0.1:8443`, nohup, groups=poc-tenant-a (재부팅 시 `w1-run-webhook.sh start` 로 수동 재기동) |
+| 웹훅 프로세스 | pid 333469, `127.0.0.1:8443`, nohup, groups=poc-tenant-a (재부팅 시 `w1-run-webhook.sh start` 로 수동 재기동) |
 | 클러스터 리소스 | ClusterRole + ClusterRoleBinding `poc-authn-node-reader` (2026-10-13T06:27Z) |
+
+## D. 산출물 위치 (git `mcpark84/lbcontroller`)
+
+| 파일 | 내용 |
+|---|---|
+| `test_result_webhook.md` | 본 문서 |
+| `PoC_auth_webook_plan.md` / `PoC_auth_webhook_실행계획.md` | 계획서 / 실행 계획 (체크포인트) |
+| `authn/webhook_server.py` | 1차 allow-all 웹훅 (2차에서 `authenticate()` 교체) |
+| `authn/webhook-kubeconfig.yaml`, `authn/audit-policy.yaml` | apiserver 측 설정 (호스트 `/etc/kubernetes/webhook/` 에 복사됨) |
+| `authn/rbac/poc-authn-node-reader.yaml` | A5 RBAC (적용 상태) |
+| `authn/scripts/w1-*.sh` | 인증서 / 디렉터리 구성, nohup start / stop / status |
+| `authn/scripts/w2-render-apiserver.py`, `w2-watch-readyz.sh` | 매니페스트 렌더 + 검증, 다운타임 측정 |
+| `authn/scripts/w3-make-token-kubeconfig.sh` | 토큰 kubeconfig 생성 |
+| mgmt01 `~/kube-apiserver.yaml.bak` | 원본 매니페스트 (A10 롤백용, git 미포함) |
