@@ -2,7 +2,7 @@
 
 > 대상 클러스터: gasandevcontrol (mgmt01 컨트롤 플레인 단일 + dev001, K8s v1.35.1)
 > 시험일: 2026-10-13 (KST 13:00 전후, 로그 시각은 UTC) / 계획서 `PoC_auth_webook_plan.md`, 실행 계획 `PoC_auth_webhook_실행계획.md`
-> 진행 상태: **S0~S4 완료, S5(apiserver 적용) 대기 중**
+> 진행 상태: **S0~S6 완료 (A0~A4 합격), S7(A5 RBAC) 대기 중**
 
 ---
 
@@ -183,6 +183,79 @@ $ python3 authn/scripts/w2-render-apiserver.py ~/kube-apiserver.yaml.bak ~/poc-a
 
 ---
 
+## 7. S5 = A1, A2 — apiserver 적용 / 다운타임 / 인증서 경로 생존
+
+**적용 시각**: 2026-10-13T06:03:10.186Z (`sudo install -m 0600 ~/poc-authn/kube-apiserver.new.yaml /etc/kubernetes/manifests/kube-apiserver.yaml`)
+
+**A1 — 재기동 관측 (`/readyz` 1초 폴링, 비인증)**
+
+| 시각(UTC) | 상태 |
+|---|---|
+| 06:03:10.221 | 첫 비정상 응답 (500 → 이후 연결 거부 000) |
+| ~06:03:40 | 구 컨테이너 `d34503e1f225` 소멸 (graceful shutdown 약 30초) |
+| 06:03:47 | 새 컨테이너 `b69ba7de7276` 기동 로그 시작 |
+| 06:03:48.681 | 마지막 비정상 응답 (403 → 500, 기동 중) |
+| 06:03:49.694 | **200 복귀** |
+
+- **다운타임 약 39.5초** (비정상 샘플 39개). 예상치 10~30초보다 길었고, 대부분은 구 apiserver 의 graceful shutdown 대기였다
+- 15초 안정화 후 `crictl ps -a`: 새 컨테이너 1개 Running, ATTEMPT 0 → **crash-loop 없음**
+- 실행 중 컨테이너 인자에 플래그 8개 전부 확인 (`crictl inspect`)
+- 재기동 직후 apiserver 로그에 dynamo-operator 의 admission 웹훅 타임아웃 경고(`failing open`) 1회 → 기존 컴포넌트의 재연결 과도기, 본 변경과 무관
+
+**A2 — 인증서 경로**
+```
+$ kubectl get nodes          # admin.conf (x509)
+dev001   Ready   <none>          77d   v1.35.1
+mgmt01   Ready   control-plane   77d   v1.35.1
+```
+웹훅 호출 수 변화 없음 (1 → 1). 인증서 사용자는 웹훅에 도달하지 않는다.
+감사 로그 `/var/log/kubernetes/audit/audit.log` 생성됨 (0 바이트, 아직 poc 신원 요청 없음).
+
+**판정: A1 합격 (다운타임 39.5초 기록), A2 합격.**
+
+---
+
+## 8. S6 = A3, A4 — 인증 성립 (401 → 403)
+
+### 8.1 1차 시도 실패와 원인 (06:04:28Z)
+
+토큰 kubeconfig 로 `get nodes` → 여전히 **401**. 웹훅 로그에 호출 없음. apiserver 로그:
+```
+webhook.go:154] Failed to make webhook authenticator request: the server could not find the requested resource
+authentication.go:75] "Unable to authenticate the request" err="[invalid bearer token, the server could not find the requested resource]"
+"Unsolicited response received on idle HTTP channel starting with \"<!DOCTYPE HTML>..."
+```
+`kubectl create -f TokenReview` (admin) 로 같은 체인을 태워도 `status.error: [invalid bearer token, the server could not find the requested resource]`.
+
+**원인**: apiserver(client-go) 는 `POST /authenticate?timeout=30s` 로 호출한다. 웹훅 서버가 경로를 `/authenticate` 와 **정확히 일치**로 비교해 404 를 돌려줬고, 404 응답 시 요청 본문을 읽지 않아 남은 바이트가 keep-alive 연결의 다음 요청 줄로 해석되어 HTML 400 이 추가로 나갔다(= "Unsolicited response"). 404 는 로그에도 남지 않았다.
+
+**조치 (커밋 8fffbfc, 웹훅 서버만 수정, apiserver 무변경)**: 쿼리를 떼고 경로 비교 / 모든 응답 전 본문 소진 / 모든 요청 줄 로그. 웹훅 재기동 (pid 264954, 06:07:03Z).
+
+### 8.2 재시도 (06:07:04Z)
+```
+$ kubectl --kubeconfig ~/poc-authn/token.kubeconfig get nodes
+Error from server (Forbidden): nodes is forbidden: User "poc-user" cannot list resource "nodes" in API group "" at the cluster scope
+
+$ kubectl --kubeconfig ~/poc-authn/token.kubeconfig auth whoami
+Username    poc-user
+UID         poc-1
+Groups      [poc-tenant-a system:authenticated]
+```
+웹훅 로그 (A4):
+```
+06:07:04 INFO addr=127.0.0.1 token=poc-toke... len=14 auds=['https://kubernetes.default.svc.cluster.local'] authenticated=True user=poc-user groups=['poc-tenant-a'] ms=0.04
+06:07:04 INFO http 127.0.0.1 "POST /authenticate?timeout=30s HTTP/1.1" 200 -
+```
+
+**판정: A3 합격 ★ (401 → 403, `User "poc-user"`), A4 합격 (토큰 앞 8자 `poc-toke` 일치).**
+
+**설계 시사점**
+- 웹훅 서버 규격에 **"경로는 쿼리 문자열을 무시하고 비교, `?timeout=<apiserver 설정값>` 이 붙는다"** 를 명시. apiserver 측 타임아웃 기본 30초가 쿼리로 전달되므로 서버 측 처리 시간 예산의 근거가 된다
+- apiserver 는 `system:authenticated` 그룹을 자동 추가한다. 웹훅이 돌려준 그룹에 더해진다
+- 웹훅 서버 자가 시험은 반드시 **apiserver 와 같은 클라이언트 동작**(쿼리 포함, keep-alive)으로 해야 한다. curl 단건 시험은 이 결함을 잡지 못했다
+
+---
+
 ## A. 판정 요약
 
 | 단계 | 항목 | 결과 |
@@ -192,16 +265,20 @@ $ python3 authn/scripts/w2-render-apiserver.py ~/kube-apiserver.yaml.bak ~/poc-a
 | S2 | 웹훅 기동 (mgmt01) | 합격 |
 | S3 = A0 | 기준선 401, 웹훅 미호출 | 합격 |
 | S4 | 매니페스트 렌더 + 사전 검증 4종 | 합격 (적용 대기) |
-| S5 = A1, A2 | 적용 / 다운타임 / 인증서 경로 생존 | 미실시 |
-| S6~S11 = A3~A9 | | 미실시 |
+| S5 = A1 | 적용, crash-loop 없음, 다운타임 **39.5초** | 합격 |
+| S5 = A2 | 인증서 경로 생존, 웹훅 미호출 | 합격 |
+| S6 = A3 | **401 → 403, `User "poc-user"`** | 합격 ★ (웹훅 경로 비교 결함 1회 수정 후) |
+| S6 = A4 | 웹훅 로그에 TokenReview 수신, 토큰 앞자리 일치 | 합격 |
+| S7~S11 = A5~A9 | | 미실시 |
 
 ## B. 현재 호스트 / 클러스터 상태
 
 | 위치 | 상태 |
 |---|---|
-| `/etc/kubernetes/manifests/kube-apiserver.yaml` | **원본 그대로** |
+| `/etc/kubernetes/manifests/kube-apiserver.yaml` | **웹훅 + 감사 플래그 적용됨** (2026-10-13T06:03Z) |
 | `~/kube-apiserver.yaml.bak` | 원본 백업 |
-| `~/poc-authn/` | `tls/`, `webhook.log`, `webhook.pid`, `token.kubeconfig`, `kube-apiserver.new.yaml` |
+| `~/poc-authn/` | `tls/`, `webhook.log`, `webhook.pid`, `token.kubeconfig`, `kube-apiserver.new.yaml`, `readyz.log` |
+| `/var/log/kubernetes/audit/audit.log` | 생성됨 (root 600) |
 | `/etc/kubernetes/webhook/` | `ca.crt`, `webhook-kubeconfig.yaml`, `audit-policy.yaml` |
-| 웹훅 프로세스 | pid 113484, `127.0.0.1:8443`, nohup (재부팅 시 `w1-run-webhook.sh start` 로 수동 재기동) |
+| 웹훅 프로세스 | pid 264954, `127.0.0.1:8443`, nohup (재부팅 시 `w1-run-webhook.sh start` 로 수동 재기동) |
 | 클러스터 리소스 | 변경 없음 (RBAC 은 S7 에서 적용) |
