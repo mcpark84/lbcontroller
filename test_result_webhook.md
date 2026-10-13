@@ -2,7 +2,7 @@
 
 > 대상 클러스터: gasandevcontrol (mgmt01 컨트롤 플레인 단일 + dev001, K8s v1.35.1)
 > 시험일: 2026-10-13 (KST 13:00 전후, 로그 시각은 UTC) / 계획서 `PoC_auth_webook_plan.md`, 실행 계획 `PoC_auth_webhook_실행계획.md`
-> 진행 상태: **S0~S6 완료 (A0~A4 합격), S7(A5 RBAC) 대기 중**
+> 진행 상태: **S0~S9, S11 완료 (A0~A7, A9 합격), S10(A8 웹훅 중단) 대기 중**
 
 ---
 
@@ -321,6 +321,136 @@ Groups      [poc-tenant-a system:authenticated]
 
 ---
 
+## 9. S7 = A5 — 인가 부여 (403 → 200)
+
+**배경**
+- 웹훅이 돌려준 신원(`poc-user`, 그룹 `poc-tenant-a`)은 RBAC 입장에서 다른 사용자와 동등하다. 그룹에 ClusterRoleBinding 을 걸면 그 범위만큼만 열린다
+- 기본 ClusterRole `view` 는 nodes 권한이 없어 `get nodes` 가 200 이 되지 않는다. nodes get/list/watch 만 가진 ClusterRole 을 따로 만들어 바인딩했다
+- 권한을 주지 않은 `get pods -A` 가 여전히 403 이면 "웹훅 신원에도 RBAC 범위가 그대로 적용된다" 는 증거가 된다
+
+**절차 / 결과 (06:27:32Z)**
+```
+$ kubectl apply -f authn/rbac/poc-authn-node-reader.yaml
+clusterrole.rbac.authorization.k8s.io/poc-authn-node-reader created
+clusterrolebinding.rbac.authorization.k8s.io/poc-authn-node-reader created
+
+$ kubectl --kubeconfig ~/poc-authn/token.kubeconfig get nodes
+NAME     STATUS   ROLES           AGE   VERSION
+dev001   Ready    <none>          77d   v1.35.1          # 200
+mgmt01   Ready    control-plane   77d   v1.35.1
+
+$ kubectl --kubeconfig ~/poc-authn/token.kubeconfig get pods -A
+Error from server (Forbidden): pods is forbidden: User "poc-user" cannot list resource "pods" ...   # 403
+
+$ kubectl --kubeconfig ~/poc-authn/token.kubeconfig auth can-i list nodes   → yes
+$ ... auth can-i list pods -A   → no
+$ ... auth can-i delete nodes   → no
+```
+감사 로그의 인가 사유: `RBAC: allowed by ClusterRoleBinding "poc-authn-node-reader" of ClusterRole "poc-authn-node-reader" to Group "poc-tenant-a"`.
+
+**판정: 합격.** 401 → 403 → 200 전 구간 성립 (목표 A1 달성).
+
+---
+
+## 10. ★ 발견 — apiserver 전역 토큰 성공 캐시 10초 (B3 설계에 직결)
+
+**배경**
+- `--authentication-token-webhook-cache-ttl=0s` 는 **웹훅 인증기 앞의 캐시**만 끈다
+- apiserver 에는 Bearer 토큰 인증기 체인 전체를 감싸는 **전역 토큰 캐시**가 하나 더 있다. 성공 결과를 **10초** 보관하며, 플래그로 노출되지 않는다 (코드상 `TokenSuccessCacheTTL` 기본값 10s, 실패는 0s = 미캐시). `kube-apiserver --help` 에 관련 플래그가 없음을 확인했다
+
+**실측** (웹훅 로그의 `authenticated=` 행 수 증가분으로 계수)
+
+| 시험 | 호출 패턴 | 웹훅 호출 수 |
+|---|---|---|
+| S7 직후 | kubectl 5회 연속 (nodes, pods, can-i 3회) = API 요청 7건 | **1** |
+| A | `get nodes` 2회, 2초 간격 | **1** |
+| B | `get nodes` 2회, 11초 간격 | **2** |
+| C | `get nodes` 3회, 1초 간격 | 1 (직전 호출의 캐시 창 안) |
+
+→ 같은 토큰으로 10초 안에 들어오는 요청은 웹훅에 가지 않는다. 10초가 지나면 다시 간다.
+
+**설계 시사점 (★ 2차 B3 전제 수정)**
+- **취소 즉시성의 하한은 웹훅 TTL 과 무관하게 10초다.** `--authentication-token-webhook-cache-ttl=0s` 로 해도 취소 후 최대 10초간 기존 토큰이 통과한다. 운영 문서에 "취소 반영 최대 10초 + 웹훅 캐시 TTL" 로 명시해야 한다
+- 반대로 성능 면에서는 유리하다. 같은 사용자가 연속으로 날리는 요청은 10초에 1번만 웹훅에 온다. B3 의 "TTL 0s 일 때 초당 웹훅 호출 수" 측정은 이 캐시를 전제로 해석해야 한다
+- 그룹 변경(S8)이나 취소 시험은 **반드시 11초 이상 기다린 뒤** 판정해야 한다. 10초 안에 재시도하면 캐시된 옛 결과를 보고 오판한다
+
+---
+
+## 11. S8 = A6 — 그룹 매핑 검증
+
+**배경**
+- 인가는 웹훅이 돌려주는 `groups` 에 걸려 있다. 웹훅 응답의 그룹을 바꾸면 같은 토큰, 같은 사용자라도 RBAC 결과가 바뀌어야 한다
+- 위 10초 캐시 때문에 변경 직후에는 옛 그룹이 유지된다. 이것도 함께 관찰했다
+
+**절차 / 결과**
+```
+$ WEBHOOK_GROUPS=poc-tenant-b bash authn/scripts/w1-run-webhook.sh restart     # 06:29:41Z
+--- 직후 (캐시 창 안)  06:29:43  get nodes → 200  (옛 그룹 poc-tenant-a 캐시)
+--- 11초 후           06:29:54  get nodes → 403  "User "poc-user" cannot list resource "nodes""
+                                 auth whoami → Groups [poc-tenant-b system:authenticated]
+$ bash authn/scripts/w1-run-webhook.sh restart                                   # poc-tenant-a 복원
+--- 11초 후           06:30:07  get nodes → 200
+```
+감사 로그에도 06:29:54 요청은 `groups=['poc-tenant-b', 'system:authenticated'] code=403`, 06:30:07 은 `poc-tenant-a … 200` 으로 남았다.
+
+**판정: 합격.** 바인딩 없는 그룹이면 403, 복원하면 200. 그룹 전환은 10초 캐시 만료 후 반영.
+
+---
+
+## 12. S9 = A7 — ServiceAccount 토큰 무영향
+
+**배경**
+- Pod 가 쓰는 SA 토큰은 JWT 이고, 체인 ③ ServiceAccount 인증기가 서명을 검증해 끝낸다. 웹훅(⑤)에는 도달하지 않아야 한다
+- 이것이 "웹훅 장애 시 Pod / 컨트롤러는 무영향" 이라는 설계 주장의 근거다
+
+**절차 / 결과** — 기존 Pod `poc-lb/mock-lb-c5664cdc6-7gcvw` (SA `mock-lb`) 안에서 python urllib 로 in-cluster API 호출
+```
+/api/v1/namespaces/poc-lb/services?limit=1 -> 200
+/api/v1/nodes?limit=1 -> 403 nodes is forbidden: User "system:serviceaccount:poc-lb:mock-lb" ...
+token: prefix eyJhbGciOi / JWT segments 3 / len 1166
+webhook calls delta during SA test: 0
+```
+SA 는 자기 RBAC 대로 동작하고(services 200, nodes 403) **웹훅 호출은 0건**. 감사 정책상 SA 요청은 기록 대상이 아니라 감사 로그에도 없음 (0건).
+
+**부수 확인 — Pod 에서 임의 문자열 토큰을 보내면**
+```
+Authorization: Bearer pod-sent-opaque-token  →  /api/v1/nodes  ->  200
+webhook calls delta: 1   (token=pod-sent... authenticated=True user=poc-user)
+```
+JWT 가 아닌 토큰은 ③ 을 통과해 웹훅에 도달하고, 1차 allow-all 웹훅은 이를 `poc-user` 로 인정했다. 감사 로그에 `user=poc-user, userAgent=Python-urllib/3.12, sourceIPs=[10.233.91.114]` (Pod IP) 로 기록됨.
+
+**판정: 합격 (A7).** 부수 확인은 결함이 아니라 1차 웹훅의 의도된 동작이지만, 아래 시사점을 남긴다.
+
+**설계 시사점**
+- 웹훅 인증기는 **클러스터 전체**에 걸린다. 외부 사용자뿐 아니라 Pod 안에서 보낸 임의 토큰도 웹훅에 도달한다. 2차에서 발급 목록 조회로 바꾸는 순간 이 경로는 닫히지만, **웹훅의 토큰 검증이 곧 클러스터의 마지막 방어선**이라는 뜻이다. allow-all 웹훅을 운영 클러스터에 올리는 일은 절대 없어야 한다
+- 감사 로그의 `sourceIPs` 와 `userAgent` 로 "같은 username 이지만 Pod 에서 온 요청" 을 구별할 수 있다
+
+---
+
+## 13. S11 = A9 — 감사 로그
+
+**배경**
+- 감사 로그는 인증 결과(username / uid / groups)와 인가 결정을 요청 단위로 남긴다. 웹훅 신원이 감사에 그대로 반영되는지가 K51 요건이다
+- 정책은 poc 신원만 Metadata, 나머지 None 으로 두었다. 인증 실패(401)는 user 가 비어 정책에 걸리지 않으며 웹훅 자체 로그로 추적한다
+
+**결과** — `/var/log/kubernetes/audit/audit.log`, 적용 후 약 27분간 **27건 전부 poc-user** (poc-tenant-a 25건, poc-tenant-b 2건). 다른 사용자 / SA / 컨트롤러 요청은 0건 (정책대로).
+
+대표 이벤트 (06:30:38Z, Pod 발 임의 토큰 요청):
+```json
+{ "level": "Metadata", "stage": "ResponseComplete",
+  "requestURI": "/api/v1/nodes?limit=1", "verb": "list",
+  "user": { "username": "poc-user", "uid": "poc-1", "groups": ["poc-tenant-a", "system:authenticated"] },
+  "sourceIPs": ["10.233.91.114"], "userAgent": "Python-urllib/3.12",
+  "responseStatus": { "code": 200 },
+  "annotations": { "authorization.k8s.io/decision": "allow",
+                   "authorization.k8s.io/reason": "RBAC: allowed by ClusterRoleBinding \"poc-authn-node-reader\" of ClusterRole \"poc-authn-node-reader\" to Group \"poc-tenant-a\"" } }
+```
+시간순으로 401(미기록) → 403(06:07:04, 06:15:57, 06:18:40) → 200(06:27:32 이후) → 그룹 변경 403(06:29:54) → 복원 200 이 그대로 남아 있어, 이 결과서의 A3 / A5 / A6 판정을 감사 로그만으로 재구성할 수 있다.
+
+**판정: 합격.** `user.username=poc-user`, `uid`, `groups`, 인가 사유, 소스 IP, UA 모두 기록.
+
+---
+
 ## A. 판정 요약
 
 | 단계 | 항목 | 결과 |
@@ -334,7 +464,12 @@ Groups      [poc-tenant-a system:authenticated]
 | S5 = A2 | 인증서 경로 생존, 웹훅 미호출 | 합격 |
 | S6 = A3 | **401 → 403, `User "poc-user"`** | 합격 ★ (웹훅 경로 비교 결함 1회 수정 후) |
 | S6 = A4 | 웹훅 로그에 TokenReview 수신, 토큰 앞자리 일치 | 합격 |
-| S7~S11 = A5~A9 | | 미실시 |
+| S7 = A5 | RBAC 바인딩 후 `get nodes` 200, `get pods -A` 403 | 합격 |
+| 발견 | 전역 토큰 성공 캐시 10초 (웹훅 TTL 0s 와 무관) | ★ B3 전제 수정 |
+| S8 = A6 | 그룹 변경 → 403, 복원 → 200 (10초 캐시 후 반영) | 합격 |
+| S9 = A7 | SA 토큰은 웹훅 미호출, SA RBAC 대로 동작 | 합격 |
+| S10 = A8 | 웹훅 중단 영향 | 미실시 |
+| S11 = A9 | 감사 로그에 poc-user / uid / groups / 인가 사유 기록 | 합격 |
 
 ## B. 현재 호스트 / 클러스터 상태
 
@@ -345,5 +480,5 @@ Groups      [poc-tenant-a system:authenticated]
 | `~/poc-authn/` | `tls/`, `webhook.log`, `webhook.pid`, `token.kubeconfig`, `kube-apiserver.new.yaml`, `readyz.log` |
 | `/var/log/kubernetes/audit/audit.log` | 생성됨 (root 600) |
 | `/etc/kubernetes/webhook/` | `ca.crt`, `webhook-kubeconfig.yaml`, `audit-policy.yaml` |
-| 웹훅 프로세스 | pid 264954, `127.0.0.1:8443`, nohup (재부팅 시 `w1-run-webhook.sh start` 로 수동 재기동) |
-| 클러스터 리소스 | 변경 없음 (RBAC 은 S7 에서 적용) |
+| 웹훅 프로세스 | pid 304931, `127.0.0.1:8443`, nohup, groups=poc-tenant-a (재부팅 시 `w1-run-webhook.sh start` 로 수동 재기동) |
+| 클러스터 리소스 | ClusterRole + ClusterRoleBinding `poc-authn-node-reader` (2026-10-13T06:27Z) |
