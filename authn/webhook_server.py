@@ -15,6 +15,7 @@ import ssl
 import sys
 import time
 from collections import namedtuple
+from urllib.parse import urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 Decision = namedtuple("Decision", "ok username uid groups error")
@@ -33,8 +34,17 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "poc-authn/0.1"
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, fmt, *args):  # silence default stderr access log
-        pass
+    def log_message(self, fmt, *args):  # route http.server's own messages to our log
+        LOG.info("http %s %s", self.client_address[0], fmt % args)
+
+    def _drain(self):
+        """Always consume the request body so leftover bytes are never parsed
+        as the next request on a keep-alive connection."""
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
+    def _route(self):
+        return urlsplit(self.path).path
 
     def _send(self, code, body):
         data = json.dumps(body).encode()
@@ -45,20 +55,23 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path == "/healthz":
+        self._drain()
+        if self._route() == "/healthz":
             self._send(200, {"status": "ok", "mode": self.server.cfg.mode,
                              "username": self.server.cfg.username,
                              "groups": self.server.cfg.groups})
             return
+        LOG.warning("addr=%s 404 GET %s", self.client_address[0], self.path)
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/authenticate":
+        t0 = time.monotonic()
+        raw = self._drain()
+        if self._route() != "/authenticate":
+            LOG.warning("addr=%s 404 POST %s ua=%s", self.client_address[0], self.path,
+                        self.headers.get("User-Agent"))
             self._send(404, {"error": "not found"})
             return
-        t0 = time.monotonic()
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b""
         try:
             review = json.loads(raw or b"{}")
         except ValueError:
