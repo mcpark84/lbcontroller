@@ -2,9 +2,11 @@
 """W2: render a new kube-apiserver static-pod manifest with the authn webhook
 and audit flags inserted. Never touches the source file.
 
-  w2-render-apiserver.py SRC DST
+  w2-render-apiserver.py SRC DST                       # phase 1: insert everything
+  w2-render-apiserver.py --set-flag K=V [--set-flag ...] SRC DST
+                                                       # phase 2: change existing flag values only
 
-Inserts, preserving the original text layout so the diff is reviewable:
+Phase-1 mode inserts, preserving the original text layout so the diff is reviewable:
   * flags after the last `- --` entry of the kube-apiserver command
   * two volumeMounts after the `volumeMounts:` line
   * two volumes after the `volumes:` line
@@ -44,10 +46,49 @@ def die(msg):
     sys.exit(1)
 
 
+def set_flags(src, dst, pairs):
+    """Replace `- --KEY=OLD` with `- --KEY=NEW` for each KEY=NEW. Each key must
+    already be present exactly once; nothing else is touched."""
+    lines = open(src).read().splitlines(keepends=True)
+    out = list(lines)
+    changed = 0
+    for key, val in pairs:
+        hits = [i for i, l in enumerate(out) if re.match(rf"^\s+- --{re.escape(key)}=", l)]
+        if len(hits) != 1:
+            die(f"flag --{key} found {len(hits)} times (need exactly 1)")
+        i = hits[0]
+        indent = re.match(r"^(\s+)", out[i]).group(1)
+        new = f"{indent}- --{key}={val}\n"
+        if new != out[i]:
+            out[i] = new
+            changed += 1
+    open(dst, "w").write("".join(out))
+    print(f"[w2] wrote {dst} ({changed} flag line(s) changed)")
+    try:
+        import yaml
+    except ImportError:
+        die("PyYAML missing; cannot validate. apt install python3-yaml")
+    doc = yaml.safe_load(open(dst))
+    cmd = doc["spec"]["containers"][0]["command"]
+    for key, val in pairs:
+        if f"--{key}={val}" not in cmd:
+            die(f"flag missing after parse: --{key}={val}")
+    print(f"[w2] yaml ok: {len(cmd)} command args")
+
+
 def main():
-    if len(sys.argv) != 3:
+    args = sys.argv[1:]
+    pairs = []
+    while args and args[0] == "--set-flag":
+        k, _, v = args[1].partition("=")
+        pairs.append((k.lstrip("-"), v))
+        args = args[2:]
+    if len(args) != 2:
         die(__doc__)
-    src, dst = sys.argv[1], sys.argv[2]
+    src, dst = args
+    if pairs:
+        set_flags(src, dst, pairs)
+        return
     lines = open(src).read().splitlines(keepends=True)
     text = "".join(lines)
     for f in FLAGS:
