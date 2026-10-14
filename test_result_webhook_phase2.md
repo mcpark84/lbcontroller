@@ -84,3 +84,149 @@
 ### 설계 시사점
 - 웹훅 교체는 apiserver 입장에서 투명하다. 검증 로직 배포 / 롤백은 웹훅 프로세스 수준에서 끝난다.
 - 토큰 DB 파일은 생성 시 644 로 만들어졌다 → `open_db` 에서 600 으로 조이도록 수정 (해시뿐이지만 소유자·테넌트 메타데이터가 있다).
+
+## 3. P3 — 발급 → 해시 저장 → 사용 (E1~E5), B1 / B2 / B7 (2026-10-14 09:22Z)
+
+### 배경
+`GET /clusters/{id}/kubeconfig` 는 토큰을 만들고 클러스터 endpoint / CA 와 함께 kubeconfig 로 조립해 준다. 사용자는 이 파일만 받는다. 표준 kubectl 은 `users[].user.token` 을 `Authorization: Bearer` 로 보내고, apiserver 는 1차와 똑같이 웹훅에 TokenReview 를 보낸다. 바뀐 것은 웹훅이 이제 해시를 조회한다는 점뿐이다.
+
+B7(소유자 필터)은 K21 "계정 비활성화 시 일괄 취소" 의 전제다. 토큰이 소유자 단위로 조회되지 않으면 일괄 취소도 할 수 없다.
+
+### 절차와 로그
+```
+09:22:05Z  w4-tok.sh kubeconfig alice a 3600      -> alice.kubeconfig, X-Token-Id: 57e7e059525f
+           token: pt_fC…(46자)  server=https://172.16.1.120:6443  current-context=gasandevcontrol
+E2         sha256sum <token> = c074428386a6cc2e…5cc5c
+           DB hash            = c074428386a6cc2e…5cc5c   (일치)
+           DB rows LIKE 'pt_%' = 0,  db+wal 파일 내 'pt_' 바이트열 = 0
+E3         GET /tokens?owner=alice -> hash_prefix "c074428386a6" 만. token / hash 필드 없음
+09:22:05Z  E4 kubectl --kubeconfig alice.kubeconfig get nodes -> 200 (dev001, mgmt01)
+           webhook.log: hash=c074428386a6 ok user=alice groups=['poc-tenant-a'] ms=6.28
+           DB last_used_at = 09:22:05Z
+09:22:05Z  E5 같은 명령 3회 연속 -> 200 ×3,  웹훅 호출 수 before=2 after=2  (호출 없음)
+09:22:05Z  bob (tenant b) 발급 -> get nodes -> 403  User "bob" cannot list resource "nodes"
+           webhook.log: hash=93d4f69d0659 ok user=bob groups=['poc-tenant-b']
+B7         GET /tokens?owner=alice -> alice 1건 / ?owner=bob -> bob 1건 / 전체 2건
+감사       apiserver audit.log: alice list nodes 200 ×4 "RBAC: allowed by ClusterRoleBinding poc-authn-node-reader"
+                                bob   list nodes 403 Forbidden
+           token_audit.jsonl: issue alice 57e7…, issue bob 6feb… (actor=dan.park)
+평문 검색   webhook.log / token_api.log / token_audit.jsonl / stderr / apiserver audit.log 모두 0건
+```
+
+### 판정
+| 항목 | 결과 |
+|---|---|
+| B1 발급 → 사용 | **합격** — API 가 준 kubeconfig 로 바로 200 |
+| B2 평문 미저장 | **합격** — DB 에 SHA-256 만, 재조회 시 접두 12자만, 로그 5종 평문 0건 |
+| B7 소유자 필터 | **합격** |
+| E5 캐시 | 10초 내 재요청은 웹훅 미호출 (1차 F1 재확인) |
+| bob 403 | 인증은 됐으나(`User "bob"`) tenant b 그룹에 바인딩 없음 → **인증과 인가가 분리**되어 있음을 2차에서도 재확인 |
+
+### 설계 시사점
+- 테넌트 → 그룹 매핑(`poc-tenant-<tenant>`)만으로 RBAC 이 테넌트 단위로 갈린다. 3차 IdP 연동은 이 그룹 목록을 외부에서 받아오는 것으로 축소된다.
+- 감사 로그의 `user.username` 이 `owner_id` 로 바로 찍히므로, 포탈 계정 ↔ 클러스터 행위를 별도 매핑표 없이 연결할 수 있다 (K51).
+
+## 4. P4 — 폐기 → 인증 실패 (E6~E10), B3 TTL 0s 측정 (2026-10-14 09:22~09:25Z)
+
+### 배경
+apiserver 의 토큰 캐시는 두 겹이다. ① 웹훅 인증기 캐시 `--authentication-token-webhook-cache-ttl` (현재 0s) ② 전역 토큰 **성공** 캐시 약 10초 (플래그 없음, 1차 발견 F1). 그래서 TTL 0s 라도 폐기가 반영되기까지 최대 10초가 걸리고, 반대로 **실패는 전역 캐시에 들어가지 않아** 무효 토큰은 매 요청 웹훅에 간다. 이 비대칭을 숫자로 확인하는 것이 P4 의 목적이다.
+
+장기 연결(watch / logs -f / exec)은 연결 수립 시 한 번 인증되고 이후 재인증하지 않는 것이 K8s 표준 동작이다. 폐기해도 이미 열린 스트림은 끊기지 않는다.
+
+### 절차와 로그
+```
+09:22:50Z  M5  kubectl get nodes -w (alice 57e7…) 백그라운드 기동 -> 2 노드 출력, 연결 유지
+09:22:52Z  M1-1 w5-measure-revoke.sh 57e7e059525f  (1초 폴링, 3초 프라이밍)
+09:22:55.757Z   DELETE /tokens/57e7e059525f  -> revoked_at 09:22:55Z
+09:22:55.8 ~ 09:23:00.0Z   200 ×5
+09:23:01.075Z   401                              -> 폐기 후 5.3초
+09:23:12Z  E8  +11초 후 3회 -> 401 ×3,  webhook.log deny reason=revoked ×3 (호출 수 3→6)
+           DB last_used_at = 09:22:50Z (watch 수립 시각) 그대로 — 폐기 후 갱신 없음
+09:23:12Z  E9  토큰 1글자 변경 -> 401, webhook.log hash=172451a75849 deny reason=unknown
+09:23:12Z  M5  watch 프로세스 생존 (폐기 후 17초), 09:23:32Z 생존 (폐기 후 37초) -> 수동 종료. 출력 11행
+09:23:32Z  M1-2 alice2 294ab6… 발급 -> 폐기 09:23:35.476Z -> 401 09:23:42.902Z  = 7.4초
+09:23:42Z  M1-3 alice3 a25b3a… 발급 -> 폐기 09:23:46.094Z -> 401 09:23:53.522Z  = 7.4초
+09:23:53Z  M3  유효 토큰(alice4 656c…) 30초 연속 kubectl
+             직렬 1   : kubectl 653건 (21.8 req/s)  웹훅 3건 (0.10 call/s)
+             병렬 5   : kubectl 2860건 (95.3 req/s) 웹훅 3건 (0.10 call/s)
+09:24:53Z  M4  폐기 토큰(alice 57e7…) 30초 연속 kubectl
+             직렬 1   : kubectl 692건 (23.1 req/s, 성공 0)  웹훅 692건 (23.07 call/s)  = 1:1
+09:25:23Z  E10 해시 c074428386a6 로 세 로그 연결
+             token_audit.jsonl : issue 09:22:05Z (dan.park) / revoke 09:22:55Z (w5)
+             webhook.log       : ok 2건 (09:22:05 E4, 09:22:50 watch) / deny 696건 (E7 1 + E8 3 + M4 692)
+             apiserver audit   : username=alice 3548건 전부 200 (401 은 user 가 비어 정책상 미기록)
+```
+
+### 판정
+| 측정 | 결과 | 판정 |
+|---|---|---|
+| M1 폐기 → 첫 401 (TTL 0s) | **5.3 / 7.4 / 7.4초** | ≤ 10초. **합격**. 지연은 전적으로 전역 10초 캐시 |
+| E8 폐기 후 재시도 | 매 요청 웹훅 도달, `revoked` 거부, `last_used_at` 불변 | **합격** |
+| E9 미존재 토큰 | `unknown` 거부 | **합격** |
+| M3 유효 토큰 호출률 | 95 req/s 에도 웹훅 **0.1 call/s** (토큰당 10초에 1회) | TTL 0s 가 "매 요청 호출" 이 아님을 실증 |
+| M4 폐기 토큰 호출률 | 요청 수 = 웹훅 호출 수 (**23 call/s**) | ★ 실패는 캐시되지 않음 |
+| M5 장기 연결 | 폐기 후 37초 이상 watch 유지 | 표준 동작. 런북에 "폐기는 신규 요청만 차단" 명시 |
+
+### 설계 시사점 ★
+- **TTL 0s 의 실제 비용은 유효 토큰이 아니라 무효 토큰이다.** 유효 토큰은 전역 캐시 덕에 10초에 1회지만, 폐기·만료·위조 토큰을 반복 제시하면 요청 수 그대로 웹훅에 꽂힌다. 웹훅 쪽 rate-limit 또는 TTL > 0 (실패도 캐시) 중 하나는 필요하다. P8 의 TTL 2m 측정(M4 재측정)이 이 결정의 나머지 반쪽이다.
+- 폐기 즉시성의 하한 10초는 플래그로 줄일 수 없다. 운영 문서에는 "폐기 후 최대 10초 + 웹훅 TTL" 로 쓴다.
+- 장기 연결은 폐기로 끊기지 않으므로, 즉시 차단이 필요하면 **RBAC 바인딩 제거**(인가는 매 요청 평가) 또는 apiserver 재기동이 수단이다.
+
+## 5. P5 — B4 만료 (2026-10-14 09:26Z)
+
+### 배경
+만료는 폐기와 달리 운영자 행위 없이 시각만으로 거부된다. 검증 순서상 `revoked_at` 다음에 `expires_at` 을 본다. 전역 10초 캐시 때문에 만료 시각 이후 최대 10초까지 통과할 수 있다.
+
+### 절차와 로그
+```
+09:26:07Z  alice ttl=30 발급 (726f03584e6b), expires_at = 09:26:37Z
+09:26:07Z  즉시 200 (웹훅 ok)
+09:26:27Z  t+20s 200 (웹훅 ok — 캐시 갱신)
+09:26:27 ~ 09:26:36Z  1초 폴링 200 ×10
+09:26:37.769Z  401,  webhook.log deny reason=expired
+```
+### 판정
+**합격.** 만료 시각 +0.8초에 401. 이번에는 직전 캐시 갱신(09:26:27)이 만료 시각에 정확히 10초 앞서 있어 지연이 없었지만, 일반적으로는 최대 10초 늦을 수 있다.
+
+## 6. P6 — B5 클러스터 바인딩 (2026-10-14 09:26Z)
+
+### 배경
+웹훅 하나가 여러 클러스터를 받을 때, A 클러스터용 토큰이 B 클러스터에서 통하면 안 된다. apiserver 가 보내는 TokenReview 의 `spec.audiences` 는 클러스터 구분에 쓸 수 없다 (이 클러스터는 `--api-audiences` 미설정이라 암묵 audience 하나뿐이고, 다른 클러스터도 대개 같은 값이다). 그래서 토큰 row 의 `cluster` 와 웹훅이 아는 자기 클러스터 ID(`--cluster-id`) 를 비교한다. 단일 클러스터 PoC 라 "다른 클러스터용으로 발급한 토큰을 이 클러스터에 제시" 로 모사했다. 운영에서는 P8 의 mTLS 클라이언트 인증서 CN 이 호출 클러스터 ID 가 된다.
+
+### 절차와 로그
+```
+09:26:37Z  POST /tokens {owner_id: eve, tenant: a, cluster: other-cluster}  -> 30ed3ebb7968
+           w3-make-token-kubeconfig.sh <token> eve.kubeconfig
+09:26:37Z  kubectl --kubeconfig eve.kubeconfig get nodes -> 401
+           webhook.log hash=0bb52f909be1 deny reason=cluster-mismatch
+```
+### 판정
+**합격.** 토큰은 유효(미폐기·미만료)하지만 클러스터가 달라 거부.
+
+## 7. P7 — B6 계정 단위 일괄 폐기 (2026-10-14 09:26Z)
+
+### 배경
+K21 "계정 비활성화 시 해당 계정의 모든 토큰 무효". `DELETE /tokens?user=` 가 소유자의 미폐기 토큰 전부에 `revoked_at` 을 찍는다. 다른 소유자는 영향이 없어야 하며, 그 증거로 bob 이 **401 이 아니라 403** 을 유지하는지 본다 (403 = 인증은 계속 성립).
+
+### 절차와 로그
+```
+09:26:37Z  alice5 발급 (93c85936a575). alice 미폐기 토큰 3개 (alice4, ttl30(만료됨), alice5)
+09:26:37Z  alice4 200  alice5 200  bob 403
+09:26:38Z  DELETE /tokens?user=alice -> {"owner_id":"alice","revoked":3}
+09:26:49Z  +11s: alice4 401  alice5 401  bob 403
+           webhook.log: e22a463c102b deny revoked / 24c4eb6c7fe2 deny revoked / 93d4f69d0659 ok (bob)
+           token_audit.jsonl: {"action":"revoke-user","owner_id":"alice","revoked":3}
+```
+### 판정
+**합격.** alice 전량 401, bob 은 403 유지.
+
+---
+
+### 중간 상태 (P7 종료, 2026-10-14 09:27Z)
+| 항목 | 상태 |
+|---|---|
+| apiserver | 1차 플래그 그대로 (`cache-ttl=0s`), 재기동 없음 |
+| 웹훅 | pid 3329490, DB 모드, mTLS off |
+| 토큰 API | pid 3329325, 127.0.0.1:8080 |
+| tokens.db | 7건 (alice 6건 전부 폐기, bob 1건 유효, eve 1건 other-cluster) |
+| 다음 | P8 ✋✋ apiserver 재기동 1회 (`cache-ttl 2m` + mTLS 클라이언트 인증서) |

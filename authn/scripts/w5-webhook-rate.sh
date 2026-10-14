@@ -21,7 +21,7 @@ after=$(wc -l < "$LOG")
 req=0; okc=0
 for f in "$tmp"/*; do read -r n ok < "$f"; req=$((req+n)); okc=$((okc+ok)); done
 calls=$(sed -n "$((before+1)),${after}p" "$LOG" | grep -c ' hash=')
-printf "[w5] %ds parallel=%d kubectl=%d (ok=%d, %.1f req/s)  webhook=%d (%.2f call/s)  calls/req=%.3f\n" \
-  "$SEC" "$PAR" "$req" "$okc" "$(echo "$req/$SEC" | bc -l)" "$calls" "$(echo "$calls/$SEC" | bc -l)" \
-  "$(echo "$calls/($req>0?$req:1)" | bc -l)"
+awk -v s="$SEC" -v p="$PAR" -v r="$req" -v o="$okc" -v c="$calls" 'BEGIN{
+  printf "[w5] %ds parallel=%d kubectl=%d (ok=%d, %.1f req/s)  webhook=%d (%.2f call/s)  calls/req=%.3f\n",
+         s, p, r, o, r/s, c, c/s, (r>0 ? c/r : 0) }'
 rm -rf "$tmp"
