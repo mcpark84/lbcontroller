@@ -10,6 +10,7 @@ Revocation   : rows are never deleted; revoked_at is set (audit trail).
 import base64
 import datetime as _dt
 import hashlib
+import os
 import secrets
 import sqlite3
 import uuid
@@ -49,6 +50,10 @@ def parse(s):
 def open_db(path):
     conn = sqlite3.connect(path, timeout=2.0, isolation_level=None,  # autocommit
                            check_same_thread=False)
+    try:
+        os.chmod(path, 0o600)  # hashes + ownership metadata: owner-only (-wal/-shm inherit this)
+    except OSError:
+        pass
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=2000")
