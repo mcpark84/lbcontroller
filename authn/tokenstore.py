@@ -6,6 +6,8 @@ Stored value : SHA-256 hex of the plaintext. Plaintext is never written.
                (NIST SP 800-63B: look-up secrets with >=112 bits of entropy
                only need an approved one-way hash; no salt / slow KDF.)
 Revocation   : rows are never deleted; revoked_at is set (audit trail).
+Role         : bound at issuance (skt-admin / tenant-operator / tenant-user).
+               The webhook maps it to group "mk8s:<role>"; RBAC binds the group.
 """
 import base64
 import datetime as _dt
@@ -26,13 +28,16 @@ CREATE TABLE IF NOT EXISTS tokens (
   created_at   TEXT NOT NULL,
   expires_at   TEXT,
   revoked_at   TEXT,
-  last_used_at TEXT
+  last_used_at TEXT,
+  role         TEXT NOT NULL DEFAULT 'legacy'
 );
 CREATE INDEX IF NOT EXISTS tokens_owner ON tokens(owner_id);
 """
-PUBLIC_COLS = ("id", "owner_id", "tenant", "cluster", "issued_via",
+PUBLIC_COLS = ("id", "owner_id", "tenant", "cluster", "role", "issued_via",
                "created_at", "expires_at", "revoked_at", "last_used_at")
 PREFIX = "pt_"
+ROLES = ("skt-admin", "tenant-operator", "tenant-user")
+LEGACY_ROLE = "legacy"  # rows issued before the role column existed
 
 
 def now():
@@ -58,6 +63,9 @@ def open_db(path):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=2000")
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(tokens)")}
+    if "role" not in cols:  # migrate a pre-role database in place
+        conn.execute(f"ALTER TABLE tokens ADD COLUMN role TEXT NOT NULL DEFAULT '{LEGACY_ROLE}'")
     return conn
 
 
@@ -80,20 +88,23 @@ def public(row):
     return d
 
 
-def issue(conn, owner_id, tenant, cluster, issued_via, ttl_seconds):
+def issue(conn, owner_id, tenant, cluster, issued_via, ttl_seconds, role):
+    if role not in ROLES:
+        raise ValueError(f"role must be one of {ROLES}")
     plaintext = new_token()
     t = now()
     row = {
         "id": uuid.uuid4().hex[:12],
         "hash": hash_token(plaintext),
         "owner_id": owner_id, "tenant": tenant, "cluster": cluster,
-        "issued_via": issued_via,
+        "issued_via": issued_via, "role": role,
         "created_at": iso(t),
         "expires_at": iso(t + _dt.timedelta(seconds=int(ttl_seconds))) if ttl_seconds else None,
         "revoked_at": None, "last_used_at": None,
     }
-    conn.execute("INSERT INTO tokens VALUES (:id,:hash,:owner_id,:tenant,:cluster,:issued_via,"
-                 ":created_at,:expires_at,:revoked_at,:last_used_at)", row)
+    conn.execute("INSERT INTO tokens (id,hash,owner_id,tenant,cluster,issued_via,created_at,expires_at,"
+                 "revoked_at,last_used_at,role) VALUES (:id,:hash,:owner_id,:tenant,:cluster,:issued_via,"
+                 ":created_at,:expires_at,:revoked_at,:last_used_at,:role)", row)
     return plaintext, row
 
 
@@ -144,7 +155,11 @@ def verify(conn, plaintext, cluster_id):
 
 
 def identity(row):
-    """Fixed mapping for phase 2 (IdP integration is phase 3)."""
-    return {"username": row["owner_id"],
-            "uid": row["owner_id"],
-            "groups": ["poc-tenant-" + row["tenant"]]}
+    """username = owner. groups = role group (RBAC) + tenant group (kept so the
+    phase-1 audit policy, which matches poc-tenant-*, keeps logging without an
+    apiserver restart). Legacy rows get the tenant group only."""
+    groups = []
+    if row["role"] != LEGACY_ROLE:
+        groups.append("mk8s:" + row["role"])
+    groups.append("poc-tenant-" + row["tenant"])
+    return {"username": row["owner_id"], "uid": row["owner_id"], "groups": groups}

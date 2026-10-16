@@ -1,0 +1,21 @@
+# Lets tenant roles `kubectl get ns <customer-ns>` (resourceNames can scope `get`, not `list`).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mk8s-tenant-namespace-get
+  labels: {app.kubernetes.io/part-of: poc-authn}
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
+    resourceNames: ["default", "dynamo-system", "inferium"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mk8s-tenant-namespace-get
+  labels: {app.kubernetes.io/part-of: poc-authn}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: mk8s-tenant-namespace-get}
+subjects:
+  - {apiGroup: rbac.authorization.k8s.io, kind: Group, name: "mk8s:tenant-operator"}
+  - {apiGroup: rbac.authorization.k8s.io, kind: Group, name: "mk8s:tenant-user"}

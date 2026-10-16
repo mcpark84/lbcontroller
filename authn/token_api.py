@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """PoC token issuing API (the "portal" side). Standard library only.
 
-  POST   /tokens                        body {owner_id, tenant, cluster?, ttl_seconds?}
+  POST   /tokens                        body {owner_id, tenant, role, cluster?, ttl_seconds?}
   GET    /tokens[?owner=]               list (hash_prefix only, never plaintext)
   DELETE /tokens/{id}                   revoke one
   DELETE /tokens?user={owner}           revoke every token of one owner
-  GET    /clusters/{id}/kubeconfig?owner=&tenant=&ttl=
+  GET    /clusters/{id}/kubeconfig?owner=&tenant=&role=&ttl=
                                         issue (issued_via=kubeconfig) and return a kubeconfig
   GET    /healthz
 
+role is one of skt-admin / tenant-operator / tenant-user (400 otherwise) and is
+bound to the token for life: changing a role means a new token.
 Plaintext is returned exactly once (POST /tokens, GET .../kubeconfig).
 Every issue / revoke is appended to --audit-log as one JSON line.
 Requests carry an optional X-Actor header, recorded in the audit line.
@@ -90,9 +92,9 @@ class Handler(BaseHTTPRequestHandler):
             f.write(json.dumps(rec) + "\n")
         LOG.info("%s %s", action, json.dumps(fields))
 
-    def _issue(self, owner, tenant, cluster, ttl, via):
-        plaintext, row = ts.issue(self.server.db, owner, tenant, cluster, via, ttl)
-        self._audit("issue", token_id=row["id"], owner_id=owner, tenant=tenant,
+    def _issue(self, owner, tenant, role, cluster, ttl, via):
+        plaintext, row = ts.issue(self.server.db, owner, tenant, cluster, via, ttl, role)
+        self._audit("issue", token_id=row["id"], owner_id=owner, tenant=tenant, role=role,
                     cluster=cluster, issued_via=via, expires_at=row["expires_at"],
                     hash_prefix=row["hash"][:12])
         return plaintext, row
@@ -107,7 +109,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if u.path == "/healthz":
             n = self.server.db.execute("SELECT count(*) FROM tokens").fetchone()[0]
-            return self._send(200, {"status": "ok", "db": cfg.db, "tokens": n,
+            return self._send(200, {"status": "ok", "db": cfg.db, "tokens": n, "roles": list(ts.ROLES),
                                     "cluster_id": cfg.cluster_id, "server": self.server.endpoint})
 
         if u.path == "/tokens":
@@ -121,11 +123,13 @@ class Handler(BaseHTTPRequestHandler):
             cid = parts[1]
             if cid != cfg.cluster_id:
                 return self._send(404, {"error": f"unknown cluster {cid}"})
-            owner, tenant = q.get("owner"), q.get("tenant")
-            if not owner or not tenant:
-                return self._send(400, {"error": "owner and tenant are required"})
+            owner, tenant, role = q.get("owner"), q.get("tenant"), q.get("role")
+            if not owner or not tenant or not role:
+                return self._send(400, {"error": "owner, tenant and role are required"})
+            if role not in ts.ROLES:
+                return self._send(400, {"error": f"role must be one of {list(ts.ROLES)}"})
             ttl = int(q.get("ttl") or cfg.default_ttl)
-            plaintext, row = self._issue(owner, tenant, cid, ttl, "kubeconfig")
+            plaintext, row = self._issue(owner, tenant, role, cid, ttl, "kubeconfig")
             body = KUBECONFIG_TMPL.format(cluster=cid, ca=self.server.ca, server=self.server.endpoint,
                                           owner=owner, token=plaintext)
             self.send_response(200)
@@ -148,12 +152,14 @@ class Handler(BaseHTTPRequestHandler):
         cfg = self.server.cfg
         if u.path != "/tokens":
             return self._send(404, {"error": "not found"})
-        owner, tenant = b.get("owner_id"), b.get("tenant")
-        if not owner or not tenant:
-            return self._send(400, {"error": "owner_id and tenant are required"})
+        owner, tenant, role = b.get("owner_id"), b.get("tenant"), b.get("role")
+        if not owner or not tenant or not role:
+            return self._send(400, {"error": "owner_id, tenant and role are required"})
+        if role not in ts.ROLES:
+            return self._send(400, {"error": f"role must be one of {list(ts.ROLES)}"})
         cluster = b.get("cluster") or cfg.cluster_id
         ttl = int(b.get("ttl_seconds") or cfg.default_ttl)
-        plaintext, row = self._issue(owner, tenant, cluster, ttl, "operator")
+        plaintext, row = self._issue(owner, tenant, role, cluster, ttl, "operator")
         out = ts.public(self.server.db.execute("SELECT * FROM tokens WHERE id=?", (row["id"],)).fetchone())
         out["token"] = plaintext  # the one and only time it leaves the server
         self._send(201, out)

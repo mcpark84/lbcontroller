@@ -1,0 +1,32 @@
+# role tenant-user -> group mk8s:tenant-user -> built-in 'edit' in each customer namespace only.
+# Control-plane namespaces (kube-system, gpu-operator, ...) have no binding -> 403.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mk8s-tenant-user
+  namespace: default
+  labels: {app.kubernetes.io/part-of: poc-authn, mk8s.skt.com/role: tenant-user}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edit}
+subjects:
+  - {apiGroup: rbac.authorization.k8s.io, kind: Group, name: "mk8s:tenant-user"}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mk8s-tenant-user
+  namespace: dynamo-system
+  labels: {app.kubernetes.io/part-of: poc-authn, mk8s.skt.com/role: tenant-user}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edit}
+subjects:
+  - {apiGroup: rbac.authorization.k8s.io, kind: Group, name: "mk8s:tenant-user"}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mk8s-tenant-user
+  namespace: inferium
+  labels: {app.kubernetes.io/part-of: poc-authn, mk8s.skt.com/role: tenant-user}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edit}
+subjects:
+  - {apiGroup: rbac.authorization.k8s.io, kind: Group, name: "mk8s:tenant-user"}
