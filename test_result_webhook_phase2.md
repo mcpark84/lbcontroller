@@ -330,6 +330,74 @@ P8 은 "올바른 인증서면 통과" 만 보였다. 웹훅이 정말 검증하
 - 증상은 1차 F4(웹훅 down)와 같은 "토큰 사용자 전원 즉시 401" 이고, 구분은 apiserver 로그 문구로 한다: `connection refused` = 웹훅 다운, `tls: unknown certificate authority` / `x509` = **인증서 신뢰 문제** (CA 교체, 인증서 만료, 로테이션 누락). 런북 2단계의 grep 대상에 `tls:` 를 추가.
 - 인증서 로테이션 사고의 전형이 이 모양이다. SEC09 의 자동 로테이션을 넣을 때 **웹훅 쪽 client-ca 번들에 신·구 CA 를 겹쳐 두는 기간**이 있어야 apiserver 재기동 없이 넘어갈 수 있다.
 
+## 10. P10 — B8 웹훅 장애 (hang) 와 발급 API 장애 (2026-10-16 05:12Z) ✋ 승인 후
+
+### 배경
+1차 S10 은 웹훅 프로세스를 **종료**한 경우였다. 포트가 닫혀 있어 apiserver 는 `connection refused` 로 즉시 401 을 냈다. 운영에서 더 흔한 장애는 프로세스는 살아 있는데 응답을 못 하는 **hang**(GC 정지, DB 락, 디스크 풀)이다. 이때 apiserver 는 1차 F2 에서 본 `?timeout=30s` 만큼 기다린다. `kill -STOP` 으로 그 상태를 정확히 만들 수 있다.
+
+두 번째는 발급면 장애다. 웹훅은 DB 파일만 읽고 토큰 API 프로세스와 통신하지 않으므로, 토큰 API 가 죽어도 **이미 발급된 토큰의 인증은 계속**되어야 한다.
+
+### 절차와 로그
+```
+05:12:34Z  alice-p10 로 1회 인증 (캐시 채움). alice-p10b 는 미사용 (웹훅 호출 강제용)
+05:12:34.749Z  kill -STOP <webhook>
+05:12:34.8Z    alice-p10b kubectl 시작 (백그라운드)
+05:12:37Z  hang 중  admin -> 2 nodes 정상
+           hang 중  SA 토큰(kubectl create token default) -> 403 (SA 로 인증됨, RBAC 없음) 정상
+           hang 중  alice-p10 (3초 전 인증, 캐시) -> 200
+           hang 중  apiserver -> 8443 established 연결 1개 (대기 중)
+05:13:04.797Z  alice-p10b 결과: 401  — **정확히 30.0초** 후
+           apiserver 로그 ×1: Failed to make webhook authenticator request: Post ".../authenticate?timeout=30s":
+                              net/http: request canceled (Client.Timeout exceeded while awaiting headers)
+05:13:04.847Z  kill -CONT  (hang 30.09초)
+05:13:05Z  alice-p10b -> 200, webhook.log peer_cn=kube-apiserver (즉시 복귀)
+05:13:05Z  토큰 API stop.  발급 시도 -> 연결 실패 (예상)
+05:13:17Z  alice-p10b -> 200 (캐시)
+           API 다운 중 DB 에 직접 넣은 토큰(장애 전 발급분 모사) 첫 사용 -> 200, 웹훅 로그 ok
+05:13:17Z  토큰 API start (pid 183224)
+```
+
+### 판정
+| 항목 | 결과 |
+|---|---|
+| hang 중 신규 토큰 인증 | **30.0초 대기 후 401**. 재시도 없이 1회 (`Client.Timeout exceeded`) |
+| hang 중 admin / SA / 캐시된 토큰 | 모두 정상 |
+| CONT 후 | 1초 내 복귀 |
+| 토큰 API 다운 | 기존 토큰 인증 정상, 신규 발급만 불가 |
+
+### 설계 시사점 / 런북
+- 웹훅 **down** 은 즉시 401(F4), **hang** 은 사용자당 30초 멈춤 뒤 401. 사용자 체감이 다르다. hang 이 "kubectl 이 멈춰요" 로 접수되면 apiserver 로그의 `Client.Timeout exceeded while awaiting headers` 가 결정적 단서다.
+- hang 중에도 **캐시된 토큰은 계속 통과**한다(TTL 2m 동안). 장애 체감은 "새로 로그인하는 사람" 과 "2분 넘게 쉬었다가 돌아온 사람" 부터 시작된다. 이것도 TTL 을 0 이 아닌 값으로 두는 이유가 된다.
+- apiserver 는 hang 한 웹훅에 요청당 30초짜리 연결을 하나씩 잡는다. 사용자가 많으면 apiserver 의 웹훅 클라이언트 연결이 그만큼 쌓인다. 웹훅 앞단에 짧은 자체 타임아웃(예: 5초)과 헬스체크 기반 재시작이 필요하다.
+- 발급면(토큰 API, DB 쓰기)과 인증면(웹훅, DB 읽기)은 장애 도메인이 분리된다. 운영 설계에서 두 컴포넌트의 SLO 를 다르게 잡을 수 있다.
+
+## 11. P11 — B9 감사 추적 종합 + 평문 누출 전수 검사 (2026-10-16 05:14Z, 읽기 전용)
+
+### 배경
+SEC08 / K51 이 요구하는 것은 "발급 / 폐기 / 인증 성공·실패 / API 호출" 이 **누가·언제·무엇을** 으로 이어지는 것이다. 세 로그는 역할이 다르다. `token_audit.jsonl` 은 발급·폐기(actor 포함), `webhook.log` 는 인증 성공·실패와 사유(**401 은 여기에만** 남는다. apiserver 감사는 user 가 비어 정책에 안 걸림), apiserver `audit.log` 는 인증 성공 후의 API 호출과 인가 결과. 연결 키는 해시 앞 12자와 username(owner_id) 이다.
+
+### 결과
+```
+평문 전수 검사: ~/poc-authn/*.kubeconfig 의 토큰 20개 × (webhook.log, webhook.out, token_api.log, token_api.out,
+                token_audit.jsonl, apiserver audit.log, apiserver 컨테이너 로그) -> 평문 일치 0건, "pt_" 문자열 0건
+로그 규모:      webhook.log 2969행 (ok 32 / deny 1418: revoked 1401, unknown 12, expired 3, cluster-mismatch 2)
+                token_audit.jsonl 24행 (issue 17 / revoke 6 / revoke-user 1)
+                apiserver audit.log 4579행 (alice 4534, bob 6, poc-user 39)
+토큰 1개 추적 (alice-p10b, hash 5e900977c76b):
+  05:12:34Z token_audit  issue  actor=dan.park  token_id=18bf45c2c590
+  05:13:04Z webhook      ok     ← hang 중 대기하던 요청이 CONT 직후 처리됨 (apiserver 는 이미 30초 타임아웃으로 포기)
+  05:13:05Z webhook      ok     ← 재시도
+  05:13:05Z apiserver    alice list nodes 200  sourceIP 172.16.1.120  kubectl/v1.35.1
+```
+
+### 판정
+**합격.** 세 로그가 해시 접두와 username 으로 한 줄로 이어지고, 평문은 어디에도 없다.
+
+### 설계 시사점
+- SEC08 의 메타데이터 항목(actor / timestamp / source IP / action / result) 중 source IP 와 userAgent 는 apiserver 감사에만 있다. 세 로그를 **한 곳으로 모으는 파이프라인**(예: 해시 접두를 공통 필드로 S3 export) 이 운영 요건이다.
+- 인증 실패(401) 추적은 apiserver 감사가 아니라 **웹훅 로그가 1차 기록**이다. 웹훅 로그의 보존 기간(30일+)과 무결성이 SEC08 범위에 들어간다.
+- P10 의 "타임아웃 후 뒤늦게 처리된 요청" 은 웹훅 로그에는 ok 로 남지만 사용자에게는 401 이었다. 로그만으로 사용자 체감을 판단할 때 주의할 점으로 런북에 기록.
+
 ---
 
 ## 부록 A. NVIDIA "Requirements for AI Clouds" v2.4 보안 요건 대조 (2026-10-16 확인)
