@@ -231,6 +231,78 @@ K21 "계정 비활성화 시 해당 계정의 모든 토큰 무효". `DELETE /to
 | tokens.db | 7건 (alice 6건 전부 폐기, bob 1건 유효, eve 1건 other-cluster) |
 | 다음 | P8 ✋✋ apiserver 재기동 1회 (`cache-ttl 2m` + mTLS 클라이언트 인증서) |
 
+## 8. P8 — apiserver 재기동 1회: 캐시 TTL 2m + mTLS 클라이언트 인증서 (2026-10-16 03:06~03:19Z) ✋✋ 승인 후
+
+### 배경
+두 변경을 한 번의 재기동에 묶었다. ① `--authentication-token-webhook-cache-ttl` 0s → 2m (기본값). ② webhook-kubeconfig 의 `users[].user` 에 client-certificate / client-key 를 넣어 apiserver 가 웹훅에 **클라이언트 인증서를 제시**하게 함. 둘 다 apiserver 가 기동 시에만 읽는 설정이라 재기동이 필요하다.
+
+웹훅은 재기동 **전에** `--client-ca` optional 로 올려 둔다. apiserver 가 아직 인증서를 안 보내도 거부하지 않고 peer CN 만 로그에 남기므로, 재기동 뒤 CN 이 보이는 것을 눈으로 확인한 다음 required 로 올린다. 실패해도 웹훅을 optional 로 되돌리면 끝나고 apiserver 재기동은 불필요하다.
+
+TTL 2m 에서 기대하는 것: 폐기 → 401 지연이 **"폐기 시각 + 2분" 이 아니라 "마지막 웹훅 호출 시각 + 2분"** 이다. 캐시는 웹훅 응답을 받은 순간부터 산다.
+
+### 절차와 로그
+```
+03:06:09Z  w6-make-client-cert.sh --bad-ca
+           client-ca.crt / apiserver-client.crt (CN=kube-apiserver, EKU clientAuth) / bad-ca.crt
+           /etc/kubernetes/webhook/apiserver-client.{crt 644, key 600} 배치 (apiserver 컨테이너 uid 0)
+03:06:10Z  웹훅 재기동 db + client-ca OPTIONAL
+           curl(인증서 없음) -> 200 peer_cn=null / curl(인증서) -> 200 peer_cn=kube-apiserver
+03:07:28Z  새 토큰 alice-p8 / bob-p8 (10-14 발급분은 ttl 1h 만료)  -> alice 200, bob 403
+03:07:28Z  렌더: sudo cat 매니페스트 사본 -> w2 --set-flag cache-ttl=2m
+           diff (매니페스트)   58c58  - --authentication-token-webhook-cache-ttl=0s  ->  =2m
+           diff (webhook-kubeconfig)  user: {}  ->  client-certificate / client-key 2줄
+           kubectl config view 로 mtls kubeconfig 파싱 OK, openssl verify OK
+03:07:57.820Z  APPLY  webhook-kubeconfig 교체 -> 매니페스트 cp
+03:07:57.850Z  readyz 500  -> 03:07:58 연결 거부 ... 03:08:36 403 -> 03:08:37 500 -> 03:08:38.568Z 200
+               다운타임 40.7초 (1차 39.5초와 동일 패턴)
+03:08:57Z  alice 200, bob 403.  webhook.log: peer_cn=kube-apiserver ★  apiserver 로그 webhook/tls 오류 0
+03:08:58Z  웹훅 재기동 REQUIRED.  curl(인증서 없음) -> tlsv13 alert certificate required
+03:09:43Z  새 토큰으로 웹훅 호출 강제 -> 200, webhook.log peer_cn=kube-apiserver (required 에서 실제 호출 확인)
+```
+
+### B3 측정 (TTL 2m)
+```
+M1-1  prime 3s   03:09:43 캐시 채움 -> 03:09:46.5 폐기 -> 03:11:49.9 401   = 폐기 후 123.4초 (캐시 후 126초)
+M1-2  prime 60s  03:11:50 캐시 채움 -> 03:12:53.1 폐기 -> 03:13:56.4 401   = 폐기 후  63.3초 (캐시 후 126초)
+M1-3  prime 3s   03:13:56 캐시 채움 -> 03:13:59.6 폐기 -> 03:16:02.9 401   = 폐기 후 123.3초 (캐시 후 126초)
+M3    유효 토큰 30초 직렬  kubectl 599건 (20.0 req/s)  웹훅 1건 (0.03 call/s)
+M4    폐기 토큰 30초 직렬  kubectl 697건 (23.2 req/s)  웹훅 697건 (23.23 call/s) = 1:1  ← 예상 밖
+      apiserver 로그 ×700: Unable to authenticate the request err="[invalid bearer token, revoked]"
+```
+세 번 모두 **캐시 채움 + 126초**(웹훅 TTL 120 + 전역 성공 캐시 10 − 폴링 오차)에 401. 폐기 시각과 무관하다.
+
+### ★ 발견 F6 — 실패가 캐시되느냐는 웹훅 응답의 `status.error` 유무가 결정한다
+M4 가 TTL 2m 에서도 1:1 로 나와 K8s 1.35 소스를 확인했다.
+- `plugin/pkg/authenticator/token/webhook/webhook.go`: `Status.Authenticated=false` 일 때 `Status.Error` 가 **비어 있지 않으면 `(nil, false, errors.New(Status.Error))`**, 비어 있으면 `(nil, false, nil)` 을 반환.
+- `pkg/kubeapiserver/authenticator/config.go`: 웹훅 인증기는 `tokencache.New(webhook, cacheErrs=**false**, ttl, ttl)` 로 감싼다.
+- `token/cache/cached_token_authenticator.go`: `!cacheErrs && err != nil` 이면 **캐시하지 않고** 반환. `!ok && failureTTL>0` 이면 failureTTL 동안 캐시.
+
+즉 우리 웹훅이 `status.error: "revoked"` 를 돌려주는 한 apiserver 는 그것을 "오류" 로 분류해 매 요청 웹훅을 다시 부른다. 재현 확인:
+```
+03:18:36Z  웹훅 --omit-status-error 로 재기동 (required mTLS 유지)
+M4b  폐기 토큰 30초  kubectl 718건  웹훅 **1건**  (apiserver 로그: err="invalid bearer token" ×718)
+M4c  미존재 토큰 30초 kubectl 711건  웹훅 **1건**
+03:19:38Z  웹훅 기본값(status.error 포함)으로 복원
+```
+
+### 판정
+| 항목 | 결과 |
+|---|---|
+| 재기동 | crash-loop 없음, 다운타임 **40.7초**, 인증서·SA 경로 정상 |
+| mTLS | apiserver 가 클라이언트 인증서 제시 (`peer_cn=kube-apiserver`), required 전환 후에도 정상. 인증서 없는 호출은 handshake 거부 |
+| B3 M1 (2m) | 폐기 → 401 **123.4 / 63.3 / 123.3초** = 항상 캐시 채움 + 126초 |
+| B3 M3 (2m) | 유효 토큰 웹훅 호출 0.03 call/s (2분에 1회) |
+| B3 M4 (2m) | `status.error` 포함 시 **1:1** (캐시 없음), 생략 시 **30초에 1건** |
+
+### 설계 시사점 ★ (캐시 TTL 결정서의 핵심 입력)
+1. **TTL 값보다 `status.error` 처리 방침이 웹훅 부하를 좌우한다.** TTL 2m 이라도 사유를 `status.error` 에 쓰면 무효 토큰 반복은 100% 웹훅에 도달한다. 생략하면 TTL 동안 차단된다. 사유는 웹훅 로그에만 남기고 `status.error` 는 비우는 것이 맞다. apiserver 로그에는 어차피 `invalid bearer token` 만 남고, 사용자는 두 경우 모두 401 만 본다.
+2. 반대로 `status.error` 는 **"이 결과를 캐시하지 마라" 는 신호로 쓸 수 있다.** 예: DB 장애로 판정을 못 내린 경우(일시 오류)에는 error 를 채워 다음 요청이 즉시 재시도되게 하고, 확정 거부(revoked / expired / unknown)는 비워 캐시되게 한다.
+3. 폐기 즉시성은 "폐기 후 N초" 가 아니라 "마지막 사용 후 TTL + 10초" 로 문서화해야 한다. 자주 쓰는 토큰일수록 캐시가 계속 갱신되어 폐기 반영이 TTL 끝까지 밀린다.
+4. TTL 후보: 즉시성 요구가 "분 단위" 면 2m(기본) + error 생략. "10초 이내" 가 요구면 0s + 웹훅 자체 rate-limit (실패 캐시가 없으므로).
+
+### 현재 상태 (P8 종료)
+apiserver `cache-ttl=2m` + mTLS kubeconfig / 웹훅 pid 4161627 db + mTLS **required** + status.error 포함 / 토큰 API pid 3329325. `~/kube-apiserver.yaml.bak`(원본), `~/poc-authn/webhook-kubeconfig.phase1.yaml`(1차 kubeconfig) 보관.
+
 ---
 
 ## 부록 A. NVIDIA "Requirements for AI Clouds" v2.4 보안 요건 대조 (2026-10-16 확인)
