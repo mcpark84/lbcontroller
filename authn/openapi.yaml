@@ -1,0 +1,168 @@
+openapi: 3.0.3
+info:
+  title: Managed K8s Token API (PoC)
+  version: 0.1.0
+  description: |
+    Issues, lists and revokes bearer tokens for kube-apiserver access and builds
+    kubeconfigs. Tokens are verified by the apiserver's TokenReview webhook
+    against a SHA-256 hash store. Human-readable spec: authn/API.md.
+servers:
+  - url: http://127.0.0.1:8080
+    description: PoC (mgmt01 loopback, no API authentication)
+tags:
+  - {name: tokens}
+  - {name: kubeconfig}
+  - {name: ops}
+components:
+  parameters:
+    Actor:
+      name: X-Actor
+      in: header
+      required: false
+      schema: {type: string}
+      description: Caller identity recorded in the issue/revoke audit log (PoC; no authentication).
+  schemas:
+    Role:
+      type: string
+      enum: [skt-admin, tenant-operator, tenant-user]
+      description: |
+        Bound to the token at issuance. Mapped by the webhook to group `mk8s:<role>`:
+        skt-admin -> cluster-admin; tenant-operator -> view in customer namespaces;
+        tenant-user -> edit in customer namespaces.
+    Token:
+      type: object
+      required: [id, owner_id, tenant, cluster, role, issued_via, created_at, hash_prefix]
+      properties:
+        id: {type: string, example: 47456f18eecc, description: 12 hex chars; used for revoke}
+        owner_id: {type: string, example: alice, description: Becomes the Kubernetes username}
+        tenant: {type: string, example: a}
+        cluster: {type: string, example: gasandevcontrol}
+        role: {$ref: '#/components/schemas/Role'}
+        issued_via: {type: string, enum: [operator, kubeconfig]}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time, nullable: true}
+        revoked_at: {type: string, format: date-time, nullable: true, description: Set on revoke; rows are never deleted}
+        last_used_at: {type: string, format: date-time, nullable: true, description: Updated by the webhook on each successful verification}
+        hash_prefix: {type: string, example: a1b2c3d4e5f6, description: First 12 hex chars of SHA-256(token); correlation key across logs}
+    TokenWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/Token'
+        - type: object
+          required: [token]
+          properties:
+            token:
+              type: string
+              example: pt_G5e...
+              description: Plaintext bearer token (46 chars). Returned once; never retrievable again.
+    IssueRequest:
+      type: object
+      required: [owner_id, tenant, role]
+      properties:
+        owner_id: {type: string}
+        tenant: {type: string}
+        role: {$ref: '#/components/schemas/Role'}
+        cluster: {type: string, description: Defaults to the server's cluster_id. A token for another cluster is rejected here as cluster-mismatch.}
+        ttl_seconds: {type: integer, default: 86400, minimum: 1}
+    Error:
+      type: object
+      properties: {error: {type: string}}
+paths:
+  /tokens:
+    post:
+      tags: [tokens]
+      summary: Issue a token (operator path)
+      parameters: [{$ref: '#/components/parameters/Actor'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/IssueRequest'}}}
+      responses:
+        '201': {description: Issued. Plaintext returned once., content: {application/json: {schema: {$ref: '#/components/schemas/TokenWithSecret'}}}}
+        '400': {description: Missing field or invalid role, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    get:
+      tags: [tokens]
+      summary: List tokens
+      parameters:
+        - {name: owner, in: query, required: false, schema: {type: string}, description: Filter by owner_id}
+      responses:
+        '200':
+          description: Never includes plaintext or full hash.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {items: {type: array, items: {$ref: '#/components/schemas/Token'}}}
+    delete:
+      tags: [tokens]
+      summary: Revoke every unrevoked token of one owner
+      parameters:
+        - {$ref: '#/components/parameters/Actor'}
+        - {name: user, in: query, required: true, schema: {type: string}, description: owner_id}
+      responses:
+        '200':
+          description: Count of tokens revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {owner_id: {type: string}, revoked: {type: integer}}
+        '404': {description: Query parameter missing}
+  /tokens/{id}:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string}}
+    get:
+      tags: [tokens]
+      summary: Get one token
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/Token'}}}}
+        '404': {description: Not found, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    delete:
+      tags: [tokens]
+      summary: Revoke one token (idempotent; sets revoked_at)
+      parameters: [{$ref: '#/components/parameters/Actor'}]
+      description: |
+        Takes effect on the next webhook verification. The apiserver caches successful
+        results, so an already-used token keeps working for up to
+        `--authentication-token-webhook-cache-ttl` + 10 s after its last use.
+      responses:
+        '200': {description: Revoked (or already revoked), content: {application/json: {schema: {$ref: '#/components/schemas/Token'}}}}
+        '404': {description: Not found}
+  /clusters/{cluster_id}/kubeconfig:
+    get:
+      tags: [kubeconfig]
+      summary: Issue a token and return a kubeconfig for the cluster
+      parameters:
+        - {$ref: '#/components/parameters/Actor'}
+        - {name: cluster_id, in: path, required: true, schema: {type: string}}
+        - {name: owner, in: query, required: true, schema: {type: string}}
+        - {name: tenant, in: query, required: true, schema: {type: string}}
+        - {name: role, in: query, required: true, schema: {$ref: '#/components/schemas/Role'}}
+        - {name: ttl, in: query, required: false, schema: {type: integer, default: 86400}}
+      responses:
+        '200':
+          description: kubeconfig YAML. The plaintext token exists only in this document.
+          headers:
+            X-Token-Id: {schema: {type: string}}
+            X-Token-Expires: {schema: {type: string, format: date-time}}
+          content:
+            application/yaml:
+              schema: {type: string}
+        '400': {description: Missing query or invalid role}
+        '404': {description: Unknown cluster_id (this server serves one cluster)}
+  /healthz:
+    get:
+      tags: [ops]
+      summary: Health and configuration
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string}
+                  db: {type: string}
+                  tokens: {type: integer}
+                  roles: {type: array, items: {$ref: '#/components/schemas/Role'}}
+                  cluster_id: {type: string}
+                  server: {type: string, description: apiserver endpoint embedded in kubeconfigs}

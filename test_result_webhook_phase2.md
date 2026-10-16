@@ -22,7 +22,7 @@
 | P9 | mTLS 부정 시험 | 다른 CA 신뢰 시 진짜 apiserver 도 거부 (`tls: unknown certificate authority`). 웹훅 재기동만으로 복원 | 합격 |
 | P10 | B8 웹훅 hang / API 장애 | hang: **30.0초 후 401**, admin·SA·캐시 토큰 정상. 토큰 API 다운 시 인증 계속 | 합격 |
 | P11 | B9 감사 추적 | 토큰 20개 × 로그 7종 평문 0건. 세 로그가 해시 접두 + username 으로 연결 | 합격 |
-| §12 | 역할 기반 RBAC C1~C6 | skt-admin 전체 / tenant-operator 조회만 / tenant-user CRUD, 컨트롤 플레인 403, 권한 상승 403, 감사에 바인딩 이름 기록. ★ 1차 `poc-authn-node-reader` 잔존으로 테넌트 `get nodes` 허용 → 삭제 필요 | 합격 (잔존물 1건) |
+| §12 | 역할 기반 RBAC C1~C6 | skt-admin 전체 / tenant-operator 조회만 / tenant-user CRUD, 컨트롤 플레인 403, 권한 상승 403, 감사에 바인딩 이름 기록. 1차 `poc-authn-node-reader` 잔존으로 테넌트 `get nodes` 가 열렸던 것은 바인딩 삭제로 해소 | 합격 |
 | P12 | A10 롤백 | **보류** — API 문서, CLI 후 수행 | — |
 
 **2차 발견 요약**: F6 `status.error` 유무가 실패 캐시를 결정 (§8) / 폐기 즉시성 = "마지막 사용 + TTL + 10초" (§8) / hang 은 down 과 달리 30초 지연 (§10) / 401 의 1차 기록은 웹훅 로그 (§11). NVIDIA v2.4 요건 대조는 부록 A, SHA-256 결정은 부록 B.
@@ -467,6 +467,14 @@ C6 owner=dual 에 tenant-operator / skt-admin 토큰 2개 -> operator 는 kube-s
 | C6 다중 역할 | **합격** — 같은 소유자라도 토큰별 역할 독립 |
 
 **★ `get nodes` 허용 원인**: 1차 A5 에서 만든 `poc-authn-node-reader`(ClusterRoleBinding → group `poc-tenant-a`) 가 남아 있고, 웹훅이 감사 연속성을 위해 `poc-tenant-a` 그룹을 함께 돌려주기 때문이다. 감사 로그에도 `allowed by ClusterRoleBinding "poc-authn-node-reader"` 로 정확히 찍혔다. 역할 모델의 결함이 아니라 1차 잔존물이며, 해당 바인딩을 삭제하면 사라진다(감사 정책은 그룹 이름만 보므로 삭제해도 감사는 유지).
+
+### 후속 조치 (2026-10-16 05:45Z, 승인 후)
+```
+kubectl delete clusterrolebinding,clusterrole poc-authn-node-reader
++11초 후  tenant-operator get nodes -> 403 / tenant-user get nodes -> 403 / skt-admin 2 nodes
+          tenant-operator get pods default -> 200 (역할 권한 유지), 감사 로그에 u-tenant-* 계속 기록
+```
+C2 / C3 의 ★ 항목 해소. 1차 산출물 중 클러스터에 남은 것은 이제 역할 RBAC 9개뿐.
 
 ### 설계 시사점
 - **그룹은 더해지기만 한다.** 한 사용자가 여러 그룹을 받으면 권한은 합집합이다. 역할 그룹 외에 붙는 그룹(테넌트 그룹, `system:authenticated`)에 어떤 바인딩이 걸려 있는지가 실제 권한을 정한다. 운영에서는 "역할 그룹 외 바인딩 금지" 를 점검 항목으로 둬야 한다.
