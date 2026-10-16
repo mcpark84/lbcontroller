@@ -24,6 +24,7 @@
 | P11 | B9 감사 추적 | 토큰 20개 × 로그 7종 평문 0건. 세 로그가 해시 접두 + username 으로 연결 | 합격 |
 | §12 | 역할 기반 RBAC C1~C6 | skt-admin 전체 / tenant-operator 조회만 / tenant-user CRUD, 컨트롤 플레인 403, 권한 상승 403, 감사에 바인딩 이름 기록. 1차 `poc-authn-node-reader` 잔존으로 테넌트 `get nodes` 가 열렸던 것은 바인딩 삭제로 해소 | 합격 |
 | §13 | API 문서 + CLI | `authn/API.md`, `authn/openapi.yaml`, `mk8s-token` 7개 명령. 실제 클러스터에서 발급 → 사용 → 폐기 → 감사 한 바퀴 | 합격 |
+| §14 | 설계 결정 | 토큰 수명 + 캐시 TTL 2m 조합 유지 (폐기 → 새 요청 ≤ 마지막 사용 + 130초). exec plugin 방식은 후보로 기록. 유출 런북 | 결정 |
 | P12 | A10 롤백 | **보류** | — |
 
 **2차 발견 요약**: F6 `status.error` 유무가 실패 캐시를 결정 (§8) / 폐기 즉시성 = "마지막 사용 + TTL + 10초" (§8) / hang 은 down 과 달리 30초 지연 (§10) / 401 의 1차 기록은 웹훅 로그 (§11). NVIDIA v2.4 요건 대조는 부록 A, SHA-256 결정은 부록 B.
@@ -519,6 +520,32 @@ mgmt01 (실제 클러스터):
 ### 비고
 - CLI 는 폐기 직후에도 kubectl 이 한동안 되는 것을 숨기지 않는다. 대화형 모드의 폐기 메시지에는 안내 문구를 넣었다. 운영 CLI 라면 `revoke` 출력에 "마지막 사용 + TTL 까지 유효할 수 있음" 안내를 넣는 것이 맞다.
 - 로컬 시험에서 zsh 는 문자열 변수 안의 명령을 단어 분리하지 않아 `$T` 식 호출이 실패했다. 시험 스크립트는 bash 함수로 작성.
+
+## 14. 설계 결정 — 토큰 수명 + apiserver 캐시 TTL 로 접근 통제 (2026-10-16)
+
+### 배경
+접근 통제에 쓸 수 있는 시간 값은 두 개다. **토큰 수명** (`ttl_seconds`, 토큰마다, 예 90분) 과 **apiserver 웹훅 캐시 TTL** (`--authentication-token-webhook-cache-ttl`, 클러스터 전체, 현재 2m). kubeconfig 에는 자체 만료가 없고 안의 토큰 수명이 곧 kubeconfig 수명이다.
+
+대안으로 검토한 것: 긴 refresh 자격증명 + 짧은 access 토큰을 kubectl exec credential plugin 으로 자동 교환하는 방식 (EKS / GKE 패턴). 사용자는 kubeconfig 를 한 번만 받고 apiserver 는 짧은 토큰만 본다. 토큰 API 와 CLI 만 바뀌고 apiserver / 웹훅 / RBAC 은 그대로. 사용자 PC 에 CLI 배포가 전제.
+
+### 결정
+**현재 구현 유지.** 토큰 하나에 수명을 두고(예 90분), 캐시 TTL 2m 과 조합해 통제한다. exec plugin 방식은 후보로 기록만 한다.
+
+### 동작 요약 (실측 근거 §4·§8)
+- 폐기(`revoke`)하면 **새 요청은 늦어도 "마지막 사용 + 캐시 TTL + 10초"(현재 약 130초) 안에 401.** 기준점은 폐기 시각이 아니라 그 토큰이 마지막으로 웹훅을 통과한 시각이다.
+- 토큰 수명은 폐기를 못 했을 때의 안전망이다. 수명 = "유출을 못 알아챘을 때 감수할 시간" 과 "사용자가 재발급을 참을 간격" 사이에서 정한다.
+- 폐기 전에 열린 `watch` / `logs -f` / `exec` / `port-forward` 는 끝날 때까지 유지된다. 즉시 끊어야 하면 해당 역할의 RoleBinding 을 잠시 제거한다 (인가는 매 요청 평가).
+
+### 런북 — kubeconfig 유출 시
+```
+1. 누구 것인지 알면            mk8s-token revoke-user <owner> -y
+   특정 토큰만 막으려면        감사 로그 username / sourceIP → 사람 특정
+                               webhook.log 의 hash= 12자 ↔ mk8s-token list 의 HASH_PREFIX → id
+                               mk8s-token revoke <id>
+2. 열린 세션까지 끊어야 하면   kubectl delete rolebinding mk8s-<role> -n <ns>  (후에 재적용)
+3. 확인                        webhook.log 에 deny reason=revoked 가 계속 찍히면 유출 파일이 아직 사용 중이라는 신호
+4. 사용자에게 새 kubeconfig    mk8s-token (메뉴 3) 또는 kubeconfig 서브커맨드
+```
 
 ---
 
