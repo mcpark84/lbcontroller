@@ -2,6 +2,18 @@
 
 python 표준 라이브러리 단일 파일. 설치 없이 실행한다.
 
+**대화형 모드**: 인자 없이 실행하면 번호 메뉴가 뜬다. 목록에서 번호로 토큰을 골라 상세 보기·폐기, 역할도 번호로 선택한다. 어디서든 `q` 로 돌아간다.
+```bash
+python3 ~/lbcontroller/authn/cli/mk8s_token.py
+ 1) 토큰 목록 보기 / 선택해서 폐기
+ 2) 토큰 발급 (운영자, 평문 1회 출력)
+ 3) kubeconfig 발급 (파일 저장)
+ 4) 소유자 전체 폐기
+ 5) API 상태 (health)
+ q) 종료
+```
+서브커맨드를 주면 기존 비대화형 CLI 로 동작한다 (스크립트·자동화용).
+
 ```bash
 alias mk8s-token='python3 ~/lbcontroller/authn/cli/mk8s_token.py'
 export MK8S_ACTOR=dan.park            # 감사 로그의 actor (기본 $USER)

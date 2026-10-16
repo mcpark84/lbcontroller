@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """mk8s-token — CLI for the Managed K8s token API (authn/API.md).
 
+  mk8s-token                      # no arguments -> interactive menu
   mk8s-token issue       OWNER TENANT ROLE [--ttl S] [--cluster ID]
   mk8s-token kubeconfig  OWNER TENANT ROLE [--ttl S] [-o FILE]
   mk8s-token list        [--owner O] [--role R] [--status valid|revoked|expired]
@@ -173,13 +174,152 @@ def cmd_health(c, a):
             print(f"{k:11} {v}")
 
 
+# ---------- interactive mode ----------
+def ask(prompt, default=None, choices=None):
+    """Prompt with optional default / numbered choices. Empty input -> default. 'q' -> None."""
+    while True:
+        if choices:
+            for i, ch in enumerate(choices, 1):
+                print(f"   {i}) {ch}")
+        hint = f" [{default}]" if default is not None else ""
+        try:
+            v = input(f"{prompt}{hint}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if v.lower() == "q":
+            return None
+        if v == "" and default is not None:
+            return default
+        if choices:
+            if v.isdigit() and 1 <= int(v) <= len(choices):
+                return choices[int(v) - 1]
+            if v in choices:
+                return v
+            print("   번호를 고르세요 (q = 취소)")
+            continue
+        if v:
+            return v
+        print("   값을 입력하세요 (q = 취소)")
+
+
+def pick_token(c, title="토큰 목록"):
+    """List tokens with row numbers and return the chosen token dict (or None)."""
+    owner = ask("소유자 필터 (엔터 = 전체)", default="")
+    if owner is None:
+        return None
+    status = ask("상태 필터", default="valid", choices=["valid", "revoked", "expired", "all"])
+    if status is None:
+        return None
+    items = c.call("GET", "/tokens" + (f"?owner={owner}" if owner else ""))["items"]
+    for t in items:
+        t["status"] = status_of(t)
+    if status != "all":
+        items = [t for t in items if t["status"] == status]
+    print(f"\n{title} ({len(items)}건)")
+    if not items:
+        return None
+    cols = ("#",) + LIST_COLS
+    rows = [dict(t, **{"#": i}) for i, t in enumerate(items, 1)]
+    table(rows, cols)
+    n = ask("\n번호 선택 (q = 돌아가기)")
+    if n is None or not n.isdigit() or not 1 <= int(n) <= len(items):
+        return None
+    return items[int(n) - 1]
+
+
+def i_list(c):
+    t = pick_token(c)
+    if not t:
+        return
+    print(json.dumps(t, indent=1))
+    act = ask("동작", default="돌아가기", choices=["돌아가기", "이 토큰 폐기"])
+    if act == "이 토큰 폐기":
+        if ask(f"정말 {t['id']} ({t['owner_id']}, {t.get('role')}) 를 폐기할까요?", default="n", choices=["y", "n"]) == "y":
+            r = c.call("DELETE", f"/tokens/{t['id']}")
+            print(f"폐기됨 revoked_at={r['revoked_at']}  (apiserver 캐시 때문에 마지막 사용 + TTL 까지는 통과할 수 있음)")
+
+
+def i_issue(c, kubeconfig=False):
+    owner = ask("소유자 (owner_id)")
+    if not owner:
+        return
+    tenant = ask("테넌트", default="a")
+    if not tenant:
+        return
+    role = ask("역할", choices=list(ROLES))
+    if not role:
+        return
+    ttl = ask("만료 (초)", default="86400")
+    if not ttl or not ttl.isdigit():
+        return
+    if kubeconfig:
+        out = ask("저장 파일", default=f"{owner}.kubeconfig")
+        if not out:
+            return
+        payload, hdr = c.call("GET", f"/clusters/{DEFAULT_CLUSTER}/kubeconfig?owner={owner}&tenant={tenant}&role={role}&ttl={ttl}", raw=True)
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        os.chmod(out, 0o600)
+        print(f"\n저장: {out} (600)  token_id={hdr.get('X-Token-Id')}  expires={hdr.get('X-Token-Expires')}")
+        print(f"확인: kubectl --kubeconfig {out} get pods -n default")
+    else:
+        t = c.call("POST", "/tokens", {"owner_id": owner, "tenant": tenant, "role": role, "ttl_seconds": int(ttl)})
+        print(f"\n발급 id={t['id']} role={t['role']} expires={t['expires_at']}")
+        print(f"토큰 (지금 한 번만 표시): {t['token']}")
+
+
+def i_revoke_user(c):
+    owner = ask("소유자 (owner_id)")
+    if not owner:
+        return
+    items = c.call("GET", f"/tokens?owner={owner}")["items"]
+    valid = [t for t in items if status_of(t) == "valid"]
+    print(f"{owner}: 전체 {len(items)}건, 유효 {len(valid)}건")
+    if valid and ask("유효 토큰을 전부 폐기할까요?", default="n", choices=["y", "n"]) == "y":
+        r = c.call("DELETE", f"/tokens?user={owner}")
+        print(f"폐기됨 {r['revoked']}건")
+
+
+def i_health(c):
+    for k, v in c.call("GET", "/healthz").items():
+        print(f"  {k:11} {v}")
+
+
+def interactive(c):
+    menu = [
+        ("토큰 목록 보기 / 선택해서 폐기", i_list),
+        ("토큰 발급 (운영자, 평문 1회 출력)", lambda c: i_issue(c, False)),
+        ("kubeconfig 발급 (파일 저장)", lambda c: i_issue(c, True)),
+        ("소유자 전체 폐기", i_revoke_user),
+        ("API 상태 (health)", i_health),
+    ]
+    while True:
+        print(f"\n=== mk8s-token  api={c.api}  actor={c.actor} ===")
+        for i, (label, _) in enumerate(menu, 1):
+            print(f" {i}) {label}")
+        print(" q) 종료")
+        ch = ask("선택")
+        if ch is None or ch.lower() == "q":
+            print("bye")
+            return
+        if ch.isdigit() and 1 <= int(ch) <= len(menu):
+            try:
+                menu[int(ch) - 1][1](c)
+            except ApiError as e:
+                print(f"오류: {e}")
+        else:
+            print("1~5 또는 q")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="mk8s-token", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--api", default=DEFAULT_API)
     ap.add_argument("--actor", default=DEFAULT_ACTOR)
     ap.add_argument("--json", action="store_true", help="print raw API JSON")
-    sp = ap.add_subparsers(dest="cmd", required=True)
+    sp = ap.add_subparsers(dest="cmd", required=False)
 
     p = sp.add_parser("issue", help="issue a token (operator path); prints the plaintext once")
     p.add_argument("owner"); p.add_argument("tenant"); p.add_argument("role", choices=ROLES)
@@ -212,6 +352,9 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     c = Client(a.api, a.actor)
+    if a.cmd is None:          # no subcommand -> interactive menu
+        interactive(c)
+        return
     try:
         a.fn(c, a)
     except ApiError as e:
