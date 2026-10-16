@@ -23,7 +23,8 @@
 | P10 | B8 웹훅 hang / API 장애 | hang: **30.0초 후 401**, admin·SA·캐시 토큰 정상. 토큰 API 다운 시 인증 계속 | 합격 |
 | P11 | B9 감사 추적 | 토큰 20개 × 로그 7종 평문 0건. 세 로그가 해시 접두 + username 으로 연결 | 합격 |
 | §12 | 역할 기반 RBAC C1~C6 | skt-admin 전체 / tenant-operator 조회만 / tenant-user CRUD, 컨트롤 플레인 403, 권한 상승 403, 감사에 바인딩 이름 기록. 1차 `poc-authn-node-reader` 잔존으로 테넌트 `get nodes` 가 열렸던 것은 바인딩 삭제로 해소 | 합격 |
-| P12 | A10 롤백 | **보류** — API 문서, CLI 후 수행 | — |
+| §13 | API 문서 + CLI | `authn/API.md`, `authn/openapi.yaml`, `mk8s-token` 7개 명령. 실제 클러스터에서 발급 → 사용 → 폐기 → 감사 한 바퀴 | 합격 |
+| P12 | A10 롤백 | **보류** | — |
 
 **2차 발견 요약**: F6 `status.error` 유무가 실패 캐시를 결정 (§8) / 폐기 즉시성 = "마지막 사용 + TTL + 10초" (§8) / hang 은 down 과 달리 30초 지연 (§10) / 401 의 1차 기록은 웹훅 로그 (§11). NVIDIA v2.4 요건 대조는 부록 A, SHA-256 결정은 부록 B.
 
@@ -481,6 +482,40 @@ C2 / C3 의 ★ 항목 해소. 1차 산출물 중 클러스터에 남은 것은 
 - 네임스페이스가 늘면 RoleBinding 도 늘어난다. 고객 네임스페이스 생성 시 바인딩을 같이 만드는 자동화(또는 네임스페이스 라벨 기반 컨트롤러)가 필요하다.
 - `edit` 는 해당 네임스페이스의 Secret 읽기·쓰기를 포함하고 `view` 는 Secret 을 제외한다 (C2 secrets 403). 요구사항과 맞는지 확인 필요.
 - 감사 로그의 `authorization.k8s.io/reason` 이 바인딩 이름을 적어 주므로, 권한 사고 조사 시 "어느 바인딩이 열어 줬나" 를 바로 알 수 있다.
+
+## 13. API 문서와 CLI (2026-10-16 05:45~05:49Z)
+
+### 배경
+PoC 산출물을 다른 사람이 쓰려면 규격과 도구가 필요하다. 규격은 사람용(`authn/API.md`)과 기계용(`authn/openapi.yaml`, OpenAPI 3.0.3) 둘 다 두고, CLI(`authn/cli/mk8s_token.py`)는 그 규격만 보고 만든다. CLI 는 API 호출 외에 아무 로직도 갖지 않는다. 단 `list` 의 `--role` / `--status` 필터는 API 가 `owner` 필터만 제공하므로 CLI 가 응답을 받아 로컬에서 거른다(`status` 는 `revoked_at` / `expires_at` 로 계산).
+
+### 산출물
+| 파일 | 내용 |
+|---|---|
+| `authn/API.md` | 개요·흐름도, 역할/그룹/RBAC 표, 엔드포인트 7개 요청·응답 예시, 검증 순서와 폐기 반영 시간, F6 권고, 감사 로그 3종 포맷과 연결 키, 오류 코드, 보안 메모, 미구현 목록, curl 예시 |
+| `authn/openapi.yaml` | 경로 4개 (`/tokens`, `/tokens/{id}`, `/clusters/{id}/kubeconfig`, `/healthz`), 스키마 Role(enum) / Token / TokenWithSecret / IssueRequest / Error |
+| `authn/cli/mk8s_token.py`, `README.md` | 하위 명령 `issue` `kubeconfig` `list` `get` `revoke` `revoke-user` `health`, `--json`, 환경변수 `MK8S_TOKEN_API` `MK8S_ACTOR`. 종료 코드 0 / 1(API 4xx·5xx) / 2(연결 불가·사용법·중단) |
+
+### 시험
+로컬(가짜 API, 포트 18080): 7개 명령 모두 동작. 잘못된 role 은 argparse 가 rc 2 로 거부, 없는 id 폐기는 `HTTP 404` rc 1, 같은 id 재폐기는 멱등 rc 0, `revoke-user` 는 확인 질문에 `n` 이면 rc 2, API 연결 불가 rc 2. kubeconfig 파일은 600.
+
+mgmt01 (실제 클러스터):
+```
+05:48:31Z  mk8s-token kubeconfig carol a tenant-user --ttl 3600 -o carol-cli.kubeconfig  -> token_id a7f8dbf10354
+           kubectl create configmap (default) -> created / delete -> deleted / get pods kube-system -> 403
+05:48:32Z  mk8s-token list --owner carol      -> 1행, status valid, last_used_at 05:48:31Z
+           mk8s-token list --status valid     -> 12행 (legacy 7, 역할 토큰 5). role 컬럼으로 legacy 와 구분됨
+           mk8s-token revoke-user carol -y    -> revoked 1
+05:48:43Z  kubectl (+11초) -> 아직 200  ← TTL 2m 이라 마지막 사용 + 126초까지 통과 (§8 과 일치)
+           mk8s-token --json get a7f8dbf10354 -> revoked_at 기록 확인
+           token_audit.jsonl: issue / revoke-user 2행 (actor dan.park)
+```
+
+### 판정
+**합격.** CLI 만으로 발급 → 사용 → 조회 → 폐기 → 감사 확인이 끝난다.
+
+### 비고
+- CLI 는 폐기 직후에도 kubectl 이 한동안 되는 것을 숨기지 않는다. 운영 CLI 라면 `revoke` 출력에 "마지막 사용 + TTL 까지 유효할 수 있음" 안내를 넣는 것이 맞다.
+- 로컬 시험에서 zsh 는 문자열 변수 안의 명령을 단어 분리하지 않아 `$T` 식 호출이 실패했다. 시험 스크립트는 bash 함수로 작성.
 
 ---
 
