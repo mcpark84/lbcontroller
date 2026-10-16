@@ -230,3 +230,45 @@ K21 "계정 비활성화 시 해당 계정의 모든 토큰 무효". `DELETE /to
 | 토큰 API | pid 3329325, 127.0.0.1:8080 |
 | tokens.db | 7건 (alice 6건 전부 폐기, bob 1건 유효, eve 1건 other-cluster) |
 | 다음 | P8 ✋✋ apiserver 재기동 1회 (`cache-ttl 2m` + mTLS 클라이언트 인증서) |
+
+---
+
+## 부록 A. NVIDIA "Requirements for AI Clouds" v2.4 보안 요건 대조 (2026-10-16 확인)
+
+출처: https://docs.nvidia.com/dsx/ncp/nvidia-requirements-for-ai-clouds/v2.4 — 요구사항 ID 단위(SEC01~27, K8S01~32 등). 표기 규칙: **shall / must = 필수**, should = 권고.
+
+**문서에 등장하지 않는 용어**: hash, SHA, FIPS, HSM, KMS, vault, mTLS, TLS 버전, cipher, webhook. 즉 해시 알고리즘·비밀 보관 제품·TLS 세부는 지정하지 않는다.
+
+### A.1 세 질문에 대한 답
+
+| 질문 | 답 | 근거 조항 |
+|---|---|---|
+| 토큰 해시를 Vault 등 없이 저장해도 되는가 | **된다.** 단 저장 매체 암호화와 장기 자격증명 관리 요건은 적용 | SEC20 (필수) 모든 저장 데이터 암호화. SEC03 (필수) 장기 자격증명은 만료·로테이션 설정, 소유자 귀속, 미사용 탐지. SEC09 의 키 보관 요건은 "암호 키와 인증서" 대상이라 단방향 해시에는 해당 없음 |
+| SHA-256 / SHA-512 지정이 있는가 | **없다.** SHA-256 유지 (부록 B) | 해당 용어 부재 |
+| apiserver ↔ 웹훅 인증서 요건 | **상호 인증(mTLS) 과 인증서 수명주기 관리가 요건** | SEC13 모든 east-west / north-south 트래픽에 암호화 + 상호 인증. SEC09 (필수) 인증서 발급·배포·저장·자동 로테이션(간격 설정)·폐기, 만료일 필수, 감사 가능. SEC10 관리형 키·인증서 사용. SEC14 API 엔드포인트 비공개 |
+
+### A.2 설계 반영표
+
+| 조항 | 원문 요지 | 현재 PoC | 운영 설계에 필요한 것 |
+|---|---|---|---|
+| SEC03 | 장기 자격증명: configurable expiration and rotation, ownership attribution, unused account detection | `expires_at`, `owner_id`, `last_used_at` 구현. B4 / B7 / E10 으로 실증 | **로테이션(재발급) 절차** 추가. 미사용 토큰 리포트 |
+| SEC20 | 모든 데이터 at-rest 암호화 | sqlite 파일, 미암호화 디스크 | 토큰 DB 를 암호화 볼륨/DB 에 배치 |
+| SEC13 | 상호 인증 | 1차 단방향 TLS → **P8 에서 mTLS 적용** | 클러스터별 클라이언트 인증서, CN = 클러스터 ID |
+| SEC09 / SEC10 | 인증서 수명주기, 관리형 PKI | 자체서명 365일 | 플랫폼 PKI(cert-manager / 내부 CA)에서 발급·로테이션. apiserver 는 webhook-kubeconfig 를 **기동 시에만 읽으므로** 클라이언트 인증서 로테이션 = apiserver 재기동(1차 실측 약 40초). 클라이언트 인증서는 길게, 웹훅 서버 인증서는 짧게 나눠 운용 |
+| SEC14 | API 엔드포인트 방화벽 / private link | 웹훅 127.0.0.1 바인딩 | 웹훅 엔드포인트 비공개 + 네트워크 제한 + mTLS 병행 |
+| SEC08 | 인증 이벤트·인가 결정 감사 로그 30일 보존, export(S3 등), actor / timestamp / source IP / action / result | token_audit.jsonl + webhook.log + apiserver audit (PoC 신원 한정 정책) | 감사 정책을 전체 신원으로 확장, 보존·export 파이프라인. 401 은 user 가 비어 apiserver 감사에 안 남으므로 **웹훅 로그가 인증 실패의 1차 기록** |
+| SEC01 / SEC26 | 사용자 인증은 IdP 연합 SSO (OIDC / SAML 2.0). 관리자가 SSO 강제, 비연합 로그인 제한 가능 | 범위 밖 | ★ 웹훅 bearer 토큰은 **사람 로그인의 대체가 아니라 SEC03 의 장기 자격증명(API 키 / 자동화용)** 으로 자리매김. 사람용은 계획서 2안 OIDC 인증기(방식 B)가 SEC01 에 직접 대응 → 운영은 "OIDC(사람) + 웹훅 토큰(서비스 계정)" 병행 |
+| SEC19 | SOC 2 Type 1 이상 (Security / Availability / Confidentiality) | — | 알고리즘이 아니라 정책 문서화·구현 일치·변경 이력이 심사 대상 |
+| K8S17 | 표준 SA + projected token, 클러스터별 OIDC issuer / JWKS 노출 | 1차 A7 에서 SA 경로가 웹훅과 무관함을 확인 | 웹훅 도입이 SA 토큰 체계를 건드리지 않음 (체인 순서상 SA 가 먼저) |
+
+## 부록 B. 해시 알고리즘 결정서 — SHA-256 유지 (2026-10-16 결정)
+
+**결정**: 토큰 저장 해시는 `SHA-256(plaintext)` 단독. salt·pepper·느린 KDF 없음.
+
+**근거**
+1. **요건 부재**: NVIDIA v2.4, SOC 2 TSC, ISO 27001 A.8.24, PCI DSS 모두 알고리즘을 지정하지 않는다. FIPS 180-4 / NIST SP 800-131A 는 SHA-2 계열 전부를 기한 없이 승인한다. NSA CNSA 2.0 의 SHA-384 이상 권고는 국가안보 시스템 한정이다.
+2. **입력 엔트로피**: 토큰은 256비트 난수(`secrets.token_bytes(32)`). NIST SP 800-63B §5.1.2.2 는 엔트로피 112비트 이상의 look-up secret 을 승인된 단방향 해시로 저장하면 충분하다고 정하고, salt·느린 KDF 는 엔트로피가 낮은(사람이 정한) 비밀에만 요구한다. 비밀번호에 SHA-256 을 쓰지 말라는 조언은 알고리즘이 아니라 **빠른 해시 + 낮은 엔트로피** 조합에 대한 것이다.
+3. **필요한 성질은 원상 저항**: DB 유출 시 해시에서 토큰을 되돌릴 수 없으면 된다. SHA-256 의 원상 공격은 알려진 것이 없고(2017 SHAttered 는 SHA-1 충돌), 양자 Grover 를 가정해도 유효 강도 128비트로 실용적 공격 범위 밖이다. 입력이 256비트 난수라 공격자는 해시가 아니라 토큰 공간을 뒤져야 한다.
+4. **운영 비용**: 느린 KDF 는 매 인증(웹훅 호출)마다 수십 ms 를 더해 P4 의 23 call/s 같은 상황에서 웹훅 CPU 를 소모한다. SHA-256 은 로컬 측정 0.1 ms 미만.
+
+**변경 조건**: 고객·보안팀이 CNSA 2.0 을 근거로 SHA-384/512 를 요구하면 `tokenstore.hash_token` 한 줄 변경으로 전환 가능하며, 기존 토큰은 재발급이 필요하다(해시 비교 불가). 그 외 기술적 필요는 없다.
