@@ -22,7 +22,8 @@
 | P9 | mTLS 부정 시험 | 다른 CA 신뢰 시 진짜 apiserver 도 거부 (`tls: unknown certificate authority`). 웹훅 재기동만으로 복원 | 합격 |
 | P10 | B8 웹훅 hang / API 장애 | hang: **30.0초 후 401**, admin·SA·캐시 토큰 정상. 토큰 API 다운 시 인증 계속 | 합격 |
 | P11 | B9 감사 추적 | 토큰 20개 × 로그 7종 평문 0건. 세 로그가 해시 접두 + username 으로 연결 | 합격 |
-| P12 | A10 롤백 | **보류** — 추가 개발 (역할 기반 RBAC, API 문서, CLI) 후 수행 | — |
+| §12 | 역할 기반 RBAC C1~C6 | skt-admin 전체 / tenant-operator 조회만 / tenant-user CRUD, 컨트롤 플레인 403, 권한 상승 403, 감사에 바인딩 이름 기록. ★ 1차 `poc-authn-node-reader` 잔존으로 테넌트 `get nodes` 허용 → 삭제 필요 | 합격 (잔존물 1건) |
+| P12 | A10 롤백 | **보류** — API 문서, CLI 후 수행 | — |
 
 **2차 발견 요약**: F6 `status.error` 유무가 실패 캐시를 결정 (§8) / 폐기 즉시성 = "마지막 사용 + TTL + 10초" (§8) / hang 은 down 과 달리 30초 지연 (§10) / 401 의 1차 기록은 웹훅 로그 (§11). NVIDIA v2.4 요건 대조는 부록 A, SHA-256 결정은 부록 B.
 
@@ -419,6 +420,59 @@ SEC08 / K51 이 요구하는 것은 "발급 / 폐기 / 인증 성공·실패 / A
 - SEC08 의 메타데이터 항목(actor / timestamp / source IP / action / result) 중 source IP 와 userAgent 는 apiserver 감사에만 있다. 세 로그를 **한 곳으로 모으는 파이프라인**(예: 해시 접두를 공통 필드로 S3 export) 이 운영 요건이다.
 - 인증 실패(401) 추적은 apiserver 감사가 아니라 **웹훅 로그가 1차 기록**이다. 웹훅 로그의 보존 기간(30일+)과 무결성이 SEC08 범위에 들어간다.
 - P10 의 "타임아웃 후 뒤늦게 처리된 요청" 은 웹훅 로그에는 ok 로 남지만 사용자에게는 401 이었다. 로그만으로 사용자 체감을 판단할 때 주의할 점으로 런북에 기록.
+
+## 12. 역할 기반 권한 (role → 그룹 → RBAC) C1~C6 (2026-10-16 05:38~05:41Z) ✋ RBAC 적용 승인 후
+
+### 배경
+K8s 의 인가는 인증기가 돌려준 **그룹**에 바인딩을 거는 방식이다. 웹훅이 토큰의 `role` 을 그룹 `mk8s:<role>` 로 바꿔 주면, 나머지는 표준 RBAC 이다. 역할은 발급 시 토큰에 고정되고(role 변경 = 새 토큰), RBAC 은 역할별로 **사전에** 만들어 둔다. 사용자 요구:
+
+| role | 권한 | 구현 |
+|---|---|---|
+| skt-admin | 컨트롤 플레인 포함 전체 CRUD | ClusterRoleBinding → 빌트인 `cluster-admin` |
+| tenant-operator | 고객 네임스페이스 조회만, 컨트롤 플레인 접근 불가 | 고객 네임스페이스마다 RoleBinding → `view` |
+| tenant-user | 고객 네임스페이스 CRUD, 컨트롤 플레인 접근 불가 | 고객 네임스페이스마다 RoleBinding → `edit` |
+
+고객 네임스페이스는 이 클러스터에 있는 `default`, `dynamo-system`, `inferium` (slurm 은 없어 제외). 바인딩이 없는 네임스페이스는 자동으로 403 이므로 "컨트롤 플레인 접근 불가" 는 별도 거부 규칙 없이 성립한다. 테넌트 역할이 `kubectl get ns <이름>` 은 되도록 `resourceNames` 로 좁힌 ClusterRole 하나를 더 뒀다(`list` 는 resourceNames 로 못 좁히므로 목록은 불가).
+
+웹훅은 `mk8s:<role>` 과 함께 기존 `poc-tenant-<tenant>` 그룹도 돌려준다. 1차 감사 정책이 그 그룹으로 기록하기 때문에 apiserver 재기동 없이 감사가 이어진다. 기존 토큰 18건은 DB 마이그레이션으로 `role=legacy` 가 되어 이전 그룹만 받는다.
+
+### 절차와 로그
+```
+05:38:40Z  토큰 API 재기동 -> role 컬럼 추가 (legacy 18건). 웹훅 재기동 (db + mTLS required)
+           bob-p8 (legacy) -> 403 (인증 유지)
+05:40:50Z  kubectl apply -f authn/rbac/roles/   -> 9개 생성 (CRB 2, CR 1, RB 6)
+05:40:50Z  역할별 토큰 발급: u-skt-admin / u-tenant-operator / u-tenant-user (tenant a)
+
+C1 skt-admin        get pods -A OK / get nodes OK / kube-system configmap create 201, delete 200
+C2 tenant-operator  default·inferium·dynamo-system pods list 200
+                    kube-system 403 / team-b 403 / default configmap create 403 / secrets list 403
+                    get ns default 200 / get ns (목록) 403
+                    get nodes 200  ← ★ 예상 밖 (아래)
+C3 tenant-user      default·inferium configmap create 201 / get 200 / delete 200
+                    kube-system create 403, list 403 / rolebinding(admin) 생성 403 (권한 상승 시도 차단)
+                    get nodes 200  ← ★ 동일
+C4 role=root -> 400 "role must be one of [...]" / kubeconfig 경로 role=superuser -> 400
+C5 apiserver audit: 세 사용자 모두 groups 에 mk8s:<role>, 허용은 "RBAC: allowed by RoleBinding mk8s-tenant-user/default ..." 식으로 바인딩 이름까지 기록, 거부는 reason 없음(403)
+C6 owner=dual 에 tenant-operator / skt-admin 토큰 2개 -> operator 는 kube-system 403, admin 은 200. admin 토큰만 폐기
+```
+
+### 판정
+| 항목 | 결과 |
+|---|---|
+| C1 skt-admin | **합격** |
+| C2 tenant-operator | 네임스페이스 경계·읽기 전용 **합격**. 단 `get nodes` 가 허용됨 (★) |
+| C3 tenant-user | 네임스페이스 경계·CRUD·권한 상승 차단 **합격**. 단 `get nodes` 허용 (★) |
+| C4 role 검증 | **합격** |
+| C5 감사 | **합격** — 그룹과 바인딩 이름이 남아 "왜 허용됐나" 추적 가능 |
+| C6 다중 역할 | **합격** — 같은 소유자라도 토큰별 역할 독립 |
+
+**★ `get nodes` 허용 원인**: 1차 A5 에서 만든 `poc-authn-node-reader`(ClusterRoleBinding → group `poc-tenant-a`) 가 남아 있고, 웹훅이 감사 연속성을 위해 `poc-tenant-a` 그룹을 함께 돌려주기 때문이다. 감사 로그에도 `allowed by ClusterRoleBinding "poc-authn-node-reader"` 로 정확히 찍혔다. 역할 모델의 결함이 아니라 1차 잔존물이며, 해당 바인딩을 삭제하면 사라진다(감사 정책은 그룹 이름만 보므로 삭제해도 감사는 유지).
+
+### 설계 시사점
+- **그룹은 더해지기만 한다.** 한 사용자가 여러 그룹을 받으면 권한은 합집합이다. 역할 그룹 외에 붙는 그룹(테넌트 그룹, `system:authenticated`)에 어떤 바인딩이 걸려 있는지가 실제 권한을 정한다. 운영에서는 "역할 그룹 외 바인딩 금지" 를 점검 항목으로 둬야 한다.
+- 네임스페이스가 늘면 RoleBinding 도 늘어난다. 고객 네임스페이스 생성 시 바인딩을 같이 만드는 자동화(또는 네임스페이스 라벨 기반 컨트롤러)가 필요하다.
+- `edit` 는 해당 네임스페이스의 Secret 읽기·쓰기를 포함하고 `view` 는 Secret 을 제외한다 (C2 secrets 403). 요구사항과 맞는지 확인 필요.
+- 감사 로그의 `authorization.k8s.io/reason` 이 바인딩 이름을 적어 주므로, 권한 사고 조사 시 "어느 바인딩이 열어 줬나" 를 바로 알 수 있다.
 
 ---
 
