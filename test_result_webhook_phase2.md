@@ -303,6 +303,33 @@ M4c  미존재 토큰 30초 kubectl 711건  웹훅 **1건**
 ### 현재 상태 (P8 종료)
 apiserver `cache-ttl=2m` + mTLS kubeconfig / 웹훅 pid 4161627 db + mTLS **required** + status.error 포함 / 토큰 API pid 3329325. `~/kube-apiserver.yaml.bak`(원본), `~/poc-authn/webhook-kubeconfig.phase1.yaml`(1차 kubeconfig) 보관.
 
+## 9. P9 — mTLS 부정 시험: 웹훅이 다른 CA 만 신뢰할 때 (2026-10-16 05:06Z) ✋ 승인 후
+
+### 배경
+P8 은 "올바른 인증서면 통과" 만 보였다. 웹훅이 정말 검증하는지는 **진짜 apiserver 의 호출이 거부되는 것**으로 증명한다. 웹훅의 `--client-ca` 를 무관한 `bad-ca.crt` 로 바꾸면 apiserver 가 제시하는 인증서(client-ca 서명)는 신뢰 체인이 없어 handshake 에서 끊긴다. 이때 apiserver 는 TokenReview 응답 자체를 못 받으므로 1차 S10(웹훅 down)과 같은 "오류" 경로로 401 을 낸다.
+
+### 절차와 로그
+```
+05:06:45Z  웹훅 재기동 --client-ca bad-ca.crt --client-cert-required
+           curl(apiserver 인증서) -> tlsv1 alert unknown ca
+05:06:47Z  새 토큰 alice-p9 -> kubectl get nodes -> 401 (0.05초 만에 실패, 재시도 없음)
+           alice-p8 (마지막 인증 03:19Z, 캐시 만료) -> 401
+           admin -> 2 nodes (영향 없음)
+           webhook.log ×2: tls/conn error [SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate
+           apiserver  ×2: Failed to make webhook authenticator request: Post ".../authenticate?timeout=30s":
+                          remote error: tls: unknown certificate authority
+                      ×2: Unable to authenticate the request err="[invalid bearer token, Post ...: remote error: tls: unknown certificate authority]"
+05:06:47Z  --client-ca client-ca.crt 로 복원
+05:06:49Z  alice-p9 -> 200, webhook.log peer_cn=kube-apiserver
+```
+
+### 판정
+**합격.** 웹훅이 신뢰하지 않는 CA 의 인증서는 진짜 apiserver 라도 거부된다. 복원은 웹훅 재기동만으로 끝났다 (apiserver 재기동 불필요).
+
+### 설계 시사점 / 런북
+- 증상은 1차 F4(웹훅 down)와 같은 "토큰 사용자 전원 즉시 401" 이고, 구분은 apiserver 로그 문구로 한다: `connection refused` = 웹훅 다운, `tls: unknown certificate authority` / `x509` = **인증서 신뢰 문제** (CA 교체, 인증서 만료, 로테이션 누락). 런북 2단계의 grep 대상에 `tls:` 를 추가.
+- 인증서 로테이션 사고의 전형이 이 모양이다. SEC09 의 자동 로테이션을 넣을 때 **웹훅 쪽 client-ca 번들에 신·구 CA 를 겹쳐 두는 기간**이 있어야 apiserver 재기동 없이 넘어갈 수 있다.
+
 ---
 
 ## 부록 A. NVIDIA "Requirements for AI Clouds" v2.4 보안 요건 대조 (2026-10-16 확인)
