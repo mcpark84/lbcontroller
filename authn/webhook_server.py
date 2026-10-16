@@ -101,7 +101,8 @@ class Handler(BaseHTTPRequestHandler):
         self._drain()
         if self._route() == "/healthz":
             cfg = self.server.cfg
-            body = {"status": "ok", "mode": cfg.mode, "mtls": cfg.mtls, "peer_cn": self._peer_cn()}
+            body = {"status": "ok", "mode": cfg.mode, "mtls": cfg.mtls, "peer_cn": self._peer_cn(),
+                    "status_error": "omitted" if cfg.omit_status_error else "included"}
             if cfg.mode == "db":
                 body["cluster_id"] = cfg.cluster_id
                 body["db"] = cfg.db
@@ -141,7 +142,12 @@ class Handler(BaseHTTPRequestHandler):
                 # check passes. TokenReview carries no TTL; cache life is
                 # decided solely by --authentication-token-webhook-cache-ttl.
                 status["audiences"] = list(audiences)
-        else:
+        elif not self.server.cfg.omit_status_error:
+            # NOTE (finding F6): kube-apiserver turns a non-empty status.error
+            # into an *error* result, which the webhook cache never stores
+            # (cacheErrs=false). An empty status.error is a plain *failure*,
+            # cached for --authentication-token-webhook-cache-ttl. The reason
+            # is logged either way; this only controls what the apiserver sees.
             status["error"] = d.error or "unauthenticated"
 
         resp = {
@@ -184,6 +190,8 @@ def main():
     # phase-2 mTLS
     ap.add_argument("--client-ca", help="CA bundle for verifying the apiserver's client cert")
     ap.add_argument("--client-cert-required", action="store_true")
+    ap.add_argument("--omit-status-error", action="store_true",
+                    help="return authenticated:false without status.error so the apiserver caches the failure")
     ap.add_argument("--log", help="log file (also logs to stderr)")
     cfg = ap.parse_args()
     cfg.groups = [g for g in cfg.groups.split(",") if g]

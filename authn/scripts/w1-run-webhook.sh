@@ -6,6 +6,7 @@
 #                WEBHOOK_CLUSTER_ID (default gasandevcontrol)
 #                WEBHOOK_CLIENT_CA=path               -> verify apiserver client cert (optional)
 #                WEBHOOK_CLIENT_CERT_REQUIRED=1       -> reject connections without one
+#                WEBHOOK_OMIT_STATUS_ERROR=1          -> authenticated:false without status.error (apiserver caches the failure)
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 WORK=${POC_AUTHN_DIR:-$HOME/poc-authn}
@@ -25,6 +26,7 @@ start() {
   [ -n "${WEBHOOK_DB:-}" ] && args+=( --db "$WEBHOOK_DB" )
   [ -n "${WEBHOOK_CLIENT_CA:-}" ] && args+=( --client-ca "$WEBHOOK_CLIENT_CA" )
   [ "${WEBHOOK_CLIENT_CERT_REQUIRED:-0}" = 1 ] && args+=( --client-cert-required )
+  [ "${WEBHOOK_OMIT_STATUS_ERROR:-0}" = 1 ] && args+=( --omit-status-error )
   nohup python3 "$REPO/authn/webhook_server.py" "${args[@]}" >> "$WORK/webhook.out" 2>&1 &
   echo $! > "$PID"
   sleep 1
