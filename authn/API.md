@@ -44,8 +44,8 @@
 
 | 필드 | 타입 | 필수 | 설명 |
 |---|---|---|---|
-| `owner_id` | string | ✔ | 토큰 소유자. 클러스터에서 `username` 이 된다 |
-| `tenant` | string | ✔ | 테넌트 ID. 그룹 `poc-tenant-<tenant>` |
+| `owner_id` | string | ✔ | 토큰 소유자. 클러스터에서 `username` 이 된다. 형식 `^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$` (아니면 400) |
+| `tenant` | string | ✔ | 테넌트 ID. 그룹 `poc-tenant-<tenant>`. 형식 동일 |
 | `role` | string | ✔ | §2 의 3개 중 하나 |
 | `cluster` | string | | 대상 클러스터 ID. 기본값 서버의 `cluster_id`. 다른 값이면 이 클러스터에서 `cluster-mismatch` 로 거부 |
 | `ttl_seconds` | int | | 만료까지 초. 기본 86400 |
@@ -150,6 +150,7 @@ contexts:
 current-context: gasandevcontrol
 ```
 - 토큰을 새로 만들고(`issued_via=kubeconfig`) endpoint / CA 와 조립한다. 평문은 이 파일에만 존재한다.
+- YAML 스칼라는 모두 따옴표로 감싼다. `owner=3` 같은 값이 숫자로 파싱되어 kubectl 이 거부하는 것을 막기 위함(2026-10-16 수정).
 - `{cluster_id}` 가 서버의 `cluster_id` 와 다르면 `404 {"error":"unknown cluster <id>"}`. (운영: 클러스터 레지스트리에서 endpoint / CA 조회 — NKE 질문 N3)
 - `400` 필수 쿼리 누락 / role 오류.
 

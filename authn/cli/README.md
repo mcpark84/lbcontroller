@@ -14,6 +14,9 @@ python3 ~/lbcontroller/authn/cli/mk8s_token.py
 ```
 서브커맨드를 주면 기존 비대화형 CLI 로 동작한다 (스크립트·자동화용).
 
+- 발급 시 **이미 토큰이 있는 소유자**는 최근 토큰의 tenant / role 을 그대로 쓴다 (확인 한 번). 새 소유자만 tenant / role 을 묻는다.
+- kubeconfig 기본 저장 위치는 `~/.kube/<owner>.kubeconfig` (권한 600) 이고 저장 메시지에 절대 경로가 찍힌다. 사용: `export KUBECONFIG=~/.kube/<owner>.kubeconfig`
+
 ```bash
 alias mk8s-token='python3 ~/lbcontroller/authn/cli/mk8s_token.py'
 export MK8S_ACTOR=dan.park            # 감사 로그의 actor (기본 $USER)

@@ -38,6 +38,17 @@ PUBLIC_COLS = ("id", "owner_id", "tenant", "cluster", "role", "issued_via",
 PREFIX = "pt_"
 ROLES = ("skt-admin", "tenant-operator", "tenant-user")
 LEGACY_ROLE = "legacy"  # rows issued before the role column existed
+import re as _re
+IDENT_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$")
+
+
+def invalid_identifier(**fields):
+    """owner_id / tenant: 1-64 chars of [A-Za-z0-9._@-], must start alphanumeric.
+    Returns an error message or None."""
+    for name, val in fields.items():
+        if not val or not IDENT_RE.match(val):
+            return f"{name} must match {IDENT_RE.pattern}"
+    return None
 
 
 def now():

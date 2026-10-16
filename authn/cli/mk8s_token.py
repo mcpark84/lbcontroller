@@ -115,11 +115,7 @@ def cmd_issue(c, a):
 def cmd_kubeconfig(c, a):
     q = f"owner={a.owner}&tenant={a.tenant}&role={a.role}&ttl={a.ttl}"
     payload, hdr = c.call("GET", f"/clusters/{a.cluster or DEFAULT_CLUSTER}/kubeconfig?{q}", raw=True)
-    out = a.output or f"{a.owner}.kubeconfig"
-    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(payload)
-    os.chmod(out, 0o600)
+    out = save_kubeconfig(payload, a.output or default_kubeconfig_path(a.owner))
     tid, exp = hdr.get("X-Token-Id", "?"), hdr.get("X-Token-Expires", "?")
     if a.json:
         print(json.dumps({"file": out, "token_id": tid, "expires_at": exp}))
@@ -240,30 +236,58 @@ def i_list(c):
             print(f"폐기됨 revoked_at={r['revoked_at']}  (apiserver 캐시 때문에 마지막 사용 + TTL 까지는 통과할 수 있음)")
 
 
+def owner_profile(c, owner):
+    """tenant/role of the owner's most recent token, or None for a new owner."""
+    items = c.call("GET", f"/tokens?owner={owner}")["items"]
+    items = [t for t in items if t.get("role") in ROLES]
+    if not items:
+        return None
+    latest = max(items, key=lambda t: t["created_at"])
+    return latest["tenant"], latest["role"]
+
+
+def default_kubeconfig_path(owner):
+    return os.path.join(os.path.expanduser("~/.kube"), f"{owner}.kubeconfig")
+
+
+def save_kubeconfig(payload, out):
+    out = os.path.abspath(os.path.expanduser(out))
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(payload)
+    os.chmod(out, 0o600)
+    return out
+
+
 def i_issue(c, kubeconfig=False):
-    owner = ask("소유자 (owner_id)")
+    owner = ask("소유자 이름 (owner_id, 예: alice)")
     if not owner:
         return
-    tenant = ask("테넌트", default="a")
-    if not tenant:
-        return
-    role = ask("역할", choices=list(ROLES))
-    if not role:
-        return
+    prof = owner_profile(c, owner)
+    if prof:
+        tenant, role = prof
+        print(f"   기존 소유자: tenant={tenant} role={role} 로 발급합니다")
+        if ask("   그대로 진행", default="y", choices=["y", "n"]) != "y":
+            prof = None
+    if not prof:
+        tenant = ask("테넌트", default="a")
+        if not tenant:
+            return
+        role = ask("역할", choices=list(ROLES))
+        if not role:
+            return
     ttl = ask("만료 (초)", default="86400")
     if not ttl or not ttl.isdigit():
         return
     if kubeconfig:
-        out = ask("저장 파일", default=f"{owner}.kubeconfig")
+        out = ask("저장 파일", default=default_kubeconfig_path(owner))
         if not out:
             return
         payload, hdr = c.call("GET", f"/clusters/{DEFAULT_CLUSTER}/kubeconfig?owner={owner}&tenant={tenant}&role={role}&ttl={ttl}", raw=True)
-        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            f.write(payload)
-        os.chmod(out, 0o600)
+        out = save_kubeconfig(payload, out)
         print(f"\n저장: {out} (600)  token_id={hdr.get('X-Token-Id')}  expires={hdr.get('X-Token-Expires')}")
-        print(f"확인: kubectl --kubeconfig {out} get pods -n default")
+        print(f"사용: export KUBECONFIG={out}   또는   kubectl --kubeconfig {out} get pods -n default")
     else:
         t = c.call("POST", "/tokens", {"owner_id": owner, "tenant": tenant, "role": role, "ttl_seconds": int(ttl)})
         print(f"\n발급 id={t['id']} role={t['role']} expires={t['expires_at']}")
@@ -331,7 +355,7 @@ def main(argv=None):
     p.add_argument("owner"); p.add_argument("tenant"); p.add_argument("role", choices=ROLES)
     p.add_argument("--ttl", type=int, default=86400)
     p.add_argument("--cluster", help="cluster id in the URL (default gasandevcontrol)")
-    p.add_argument("-o", "--output", help="file (default <owner>.kubeconfig)")
+    p.add_argument("-o", "--output", help="file (default ~/.kube/<owner>.kubeconfig)")
     p.set_defaults(fn=cmd_kubeconfig)
 
     p = sp.add_parser("list", help="list tokens")

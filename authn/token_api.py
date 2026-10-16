@@ -31,6 +31,7 @@ import tokenstore as ts  # noqa: E402
 
 LOG = logging.getLogger("poc-token-api")
 
+# Scalars are JSON-quoted: an owner like "3" or "true" must stay a YAML string.
 KUBECONFIG_TMPL = """apiVersion: v1
 kind: Config
 clusters:
@@ -49,6 +50,11 @@ contexts:
       user: {owner}
 current-context: {cluster}
 """
+
+
+def render_kubeconfig(cluster, ca, server, owner, token):
+    q = json.dumps
+    return KUBECONFIG_TMPL.format(cluster=q(cluster), ca=q(ca), server=q(server), owner=q(owner), token=q(token))
 
 
 def cluster_endpoint(kubeconfig):
@@ -128,10 +134,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "owner, tenant and role are required"})
             if role not in ts.ROLES:
                 return self._send(400, {"error": f"role must be one of {list(ts.ROLES)}"})
+            bad = ts.invalid_identifier(owner=owner, tenant=tenant)
+            if bad:
+                return self._send(400, {"error": bad})
             ttl = int(q.get("ttl") or cfg.default_ttl)
             plaintext, row = self._issue(owner, tenant, role, cid, ttl, "kubeconfig")
-            body = KUBECONFIG_TMPL.format(cluster=cid, ca=self.server.ca, server=self.server.endpoint,
-                                          owner=owner, token=plaintext)
+            body = render_kubeconfig(cid, self.server.ca, self.server.endpoint, owner, plaintext)
             self.send_response(200)
             self.send_header("Content-Type", "application/yaml")
             self.send_header("X-Token-Id", row["id"])
@@ -157,6 +165,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "owner_id, tenant and role are required"})
         if role not in ts.ROLES:
             return self._send(400, {"error": f"role must be one of {list(ts.ROLES)}"})
+        bad = ts.invalid_identifier(owner_id=owner, tenant=tenant)
+        if bad:
+            return self._send(400, {"error": bad})
         cluster = b.get("cluster") or cfg.cluster_id
         ttl = int(b.get("ttl_seconds") or cfg.default_ttl)
         plaintext, row = self._issue(owner, tenant, role, cluster, ttl, "operator")
