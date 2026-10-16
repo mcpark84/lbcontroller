@@ -5,6 +5,7 @@
   GET    /tokens[?owner=]               list (hash_prefix only, never plaintext)
   DELETE /tokens/{id}                   revoke one
   DELETE /tokens?user={owner}           revoke every token of one owner
+  GET    /clusters/{id}                 endpoint + CA (to compose a kubeconfig around an existing token)
   GET    /clusters/{id}/kubeconfig?owner=&tenant=&role=&ttl=
                                         issue (issued_via=kubeconfig) and return a kubeconfig
   GET    /healthz
@@ -124,6 +125,12 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 2 and parts[0] == "tokens":
             row = ts.get(self.server.db, parts[1])
             return self._send(200, row) if row else self._send(404, {"error": "not found"})
+
+        if len(parts) == 2 and parts[0] == "clusters":
+            if parts[1] != cfg.cluster_id:
+                return self._send(404, {"error": f"unknown cluster {parts[1]}"})
+            return self._send(200, {"cluster_id": cfg.cluster_id, "server": self.server.endpoint,
+                                    "certificate_authority_data": self.server.ca})
 
         if len(parts) == 3 and parts[0] == "clusters" and parts[2] == "kubeconfig":
             cid = parts[1]

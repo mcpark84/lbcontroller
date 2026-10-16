@@ -126,6 +126,24 @@ paths:
       responses:
         '200': {description: Revoked (or already revoked), content: {application/json: {schema: {$ref: '#/components/schemas/Token'}}}}
         '404': {description: Not found}
+  /clusters/{cluster_id}:
+    get:
+      tags: [kubeconfig]
+      summary: Cluster endpoint and serving CA (public info for composing a kubeconfig around an existing token)
+      parameters:
+        - {name: cluster_id, in: path, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cluster_id: {type: string}
+                  server: {type: string}
+                  certificate_authority_data: {type: string, description: base64 PEM}
+        '404': {description: Unknown cluster_id}
   /clusters/{cluster_id}/kubeconfig:
     get:
       tags: [kubeconfig]

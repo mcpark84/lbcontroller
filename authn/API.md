@@ -154,7 +154,15 @@ current-context: gasandevcontrol
 - `{cluster_id}` 가 서버의 `cluster_id` 와 다르면 `404 {"error":"unknown cluster <id>"}`. (운영: 클러스터 레지스트리에서 endpoint / CA 조회 — NKE 질문 N3)
 - `400` 필수 쿼리 누락 / role 오류.
 
-### 3.7 `GET /healthz`
+### 3.7 `GET /clusters/{cluster_id}` — 클러스터 접속 정보
+
+```http
+200 OK
+{"cluster_id":"gasandevcontrol","server":"https://172.16.1.120:6443","certificate_authority_data":"<base64>"}
+```
+공개 정보(endpoint, 서버 CA)만 반환한다. **이미 발급받아 보관 중인 평문 토큰**으로 클라이언트가 kubeconfig 를 직접 조립할 때 쓴다 (CLI `wrap`). 서버는 평문을 저장하지 않으므로 기존 토큰의 kubeconfig 를 서버가 다시 만들어 줄 수는 없다. `404` 모르는 cluster_id.
+
+### 3.8 `GET /healthz`
 
 ```json
 {"status":"ok","db":"/home/ubuntu/poc-authn/tokens.db","tokens":24,
@@ -235,4 +243,4 @@ curl -s $H "$API/tokens?owner=alice"
 curl -s $H -X DELETE $API/tokens/<id>
 curl -s $H -X DELETE "$API/tokens?user=alice"
 ```
-스크립트 래퍼: `authn/scripts/w4-tok.sh issue|list|get|revoke|revoke-user|kubeconfig`.
+스크립트 래퍼: `authn/scripts/w4-tok.sh`. CLI: `authn/cli/mk8s_token.py` (대화형 메뉴 또는 `issue|kubeconfig|wrap|list|get|revoke|revoke-user|health`).

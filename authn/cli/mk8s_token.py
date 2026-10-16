@@ -3,7 +3,8 @@
 
   mk8s-token                      # no arguments -> interactive menu
   mk8s-token issue       OWNER TENANT ROLE [--ttl S] [--cluster ID]
-  mk8s-token kubeconfig  OWNER TENANT ROLE [--ttl S] [-o FILE]
+  mk8s-token kubeconfig  OWNER TENANT ROLE [--ttl S] [-o FILE]     # new token
+  mk8s-token wrap        OWNER [--token PT] [-o FILE]              # kubeconfig around an existing token
   mk8s-token list        [--owner O] [--role R] [--status valid|revoked|expired]
   mk8s-token get         ID
   mk8s-token revoke      ID [ID ...]
@@ -18,6 +19,7 @@ Standard library only.
 import argparse
 import datetime as dt
 import getpass
+import hashlib
 import json
 import os
 import sys
@@ -122,6 +124,23 @@ def cmd_kubeconfig(c, a):
     else:
         print(f"wrote {out} (mode 600)  token_id={tid}  expires={exp}")
         print(f"try: kubectl --kubeconfig {out} get pods -n default")
+
+
+def cmd_wrap(c, a):
+    tok = (a.token or sys.stdin.readline()).strip()
+    if not tok:
+        print("error: token plaintext required", file=sys.stderr); sys.exit(2)
+    h12 = hashlib.sha256(tok.encode()).hexdigest()[:12]
+    hit = next((t for t in c.call("GET", f"/tokens?owner={a.owner}")["items"] if t["hash_prefix"] == h12), None)
+    if not hit:
+        print(f"error: token not found among {a.owner}'s tokens (hash {h12})", file=sys.stderr); sys.exit(1)
+    if status_of(hit) != "valid":
+        print(f"error: token {hit['id']} is {status_of(hit)}", file=sys.stderr); sys.exit(1)
+    info = c.call("GET", f"/clusters/{DEFAULT_CLUSTER}")
+    out = save_kubeconfig(compose_kubeconfig(info["cluster_id"], info["server"], info["certificate_authority_data"], a.owner, tok),
+                          a.output or default_kubeconfig_path(a.owner))
+    print(json.dumps({"file": out, "token_id": hit["id"], "role": hit.get("role")}) if a.json
+          else f"wrote {out} (mode 600)  token_id={hit['id']}  role={hit.get('role')}")
 
 
 def cmd_list(c, a):
@@ -246,8 +265,50 @@ def owner_profile(c, owner):
     return latest["tenant"], latest["role"]
 
 
+CLI_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 def default_kubeconfig_path(owner):
-    return os.path.join(os.path.expanduser("~/.kube"), f"{owner}.kubeconfig")
+    """authn/cli/<owner>.kubeconfig (next to this script; *.kubeconfig is git-ignored)."""
+    return os.path.join(CLI_DIR, f"{owner}.kubeconfig")
+
+
+def compose_kubeconfig(cluster, server, ca, owner, token):
+    q = json.dumps
+    return (f"apiVersion: v1\nkind: Config\nclusters:\n  - name: {q(cluster)}\n    cluster:\n"
+            f"      certificate-authority-data: {q(ca)}\n      server: {q(server)}\n"
+            f"users:\n  - name: {q(owner)}\n    user:\n      token: {q(token)}\n"
+            f"contexts:\n  - name: {q(cluster)}\n    context:\n      cluster: {q(cluster)}\n      user: {q(owner)}\n"
+            f"current-context: {q(cluster)}\n").encode()
+
+
+def i_wrap_existing(c, owner):
+    """Build a kubeconfig around a token the user already holds. The plaintext
+    never leaves this machine: it is hashed locally and matched against the
+    owner's hash_prefix list to identify the token and check its status."""
+    print("   서버에는 해시만 있어 평문은 복구할 수 없습니다. 발급 때 받은 평문을 붙여 넣으세요.")
+    tok = ask("토큰 평문 (pt_...)")
+    if not tok:
+        return
+    tok = tok.strip()
+    h12 = hashlib.sha256(tok.encode()).hexdigest()[:12]
+    items = c.call("GET", f"/tokens?owner={owner}")["items"]
+    hit = next((t for t in items if t["hash_prefix"] == h12), None)
+    if not hit:
+        print(f"   이 토큰은 소유자 '{owner}' 의 토큰 목록에 없습니다 (해시 {h12}). 소유자 또는 토큰을 확인하세요.")
+        return
+    st = status_of(hit)
+    print(f"   일치: id={hit['id']} role={hit.get('role')} status={st} expires={hit.get('expires_at')}")
+    if st != "valid":
+        print(f"   {st} 상태라 kubeconfig 를 만들어도 401 입니다. 새 토큰을 발급하세요.")
+        return
+    info = c.call("GET", f"/clusters/{DEFAULT_CLUSTER}")
+    out = ask("저장 파일", default=default_kubeconfig_path(owner))
+    if not out:
+        return
+    out = save_kubeconfig(compose_kubeconfig(info["cluster_id"], info["server"], info["certificate_authority_data"], owner, tok), out)
+    print(f"\n저장: {out} (600)  token_id={hit['id']}  role={hit.get('role')}")
+    print(f"사용: export KUBECONFIG={out}   또는   kubectl --kubeconfig {out} get pods -n default")
 
 
 def save_kubeconfig(payload, out):
@@ -264,6 +325,12 @@ def i_issue(c, kubeconfig=False):
     owner = ask("소유자 이름 (owner_id, 예: alice)")
     if not owner:
         return
+    if kubeconfig:
+        how = ask("방식", default="새 토큰 발급", choices=["새 토큰 발급", "이미 받은 토큰 평문으로 만들기"])
+        if how is None:
+            return
+        if how.startswith("이미"):
+            return i_wrap_existing(c, owner)
     prof = owner_profile(c, owner)
     if prof:
         tenant, role = prof
@@ -315,7 +382,7 @@ def interactive(c):
     menu = [
         ("토큰 목록 보기 / 선택해서 폐기", i_list),
         ("토큰 발급 (운영자, 평문 1회 출력)", lambda c: i_issue(c, False)),
-        ("kubeconfig 발급 (파일 저장)", lambda c: i_issue(c, True)),
+        ("kubeconfig 만들기 (새 발급 또는 기존 토큰 평문으로)", lambda c: i_issue(c, True)),
         ("소유자 전체 폐기", i_revoke_user),
         ("API 상태 (health)", i_health),
     ]
@@ -355,8 +422,13 @@ def main(argv=None):
     p.add_argument("owner"); p.add_argument("tenant"); p.add_argument("role", choices=ROLES)
     p.add_argument("--ttl", type=int, default=86400)
     p.add_argument("--cluster", help="cluster id in the URL (default gasandevcontrol)")
-    p.add_argument("-o", "--output", help="file (default ~/.kube/<owner>.kubeconfig)")
+    p.add_argument("-o", "--output", help="file (default authn/cli/<owner>.kubeconfig)")
     p.set_defaults(fn=cmd_kubeconfig)
+
+    p = sp.add_parser("wrap", help="build a kubeconfig around an existing token (plaintext from stdin or --token)")
+    p.add_argument("owner"); p.add_argument("--token", help="plaintext; default: read one line from stdin")
+    p.add_argument("-o", "--output")
+    p.set_defaults(fn=cmd_wrap)
 
     p = sp.add_parser("list", help="list tokens")
     p.add_argument("--owner"); p.add_argument("--role", choices=ROLES)
